@@ -16,6 +16,8 @@
 #include "esp_adc/adc_oneshot.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 /* -------------------------------------------------------------------------- */
 /* Constants & Defaults                                                       */
@@ -37,6 +39,10 @@ static const char *TAG = "tds_sensor";
 
 /* DFRobot temperature compensation coefficient (per °C) */
 #define TDS_TEMP_COMP_COEFF    0.02f
+
+/* 30 samples at 40 ms apart (29 waits) reject short ADC/noise spikes. */
+#define TDS_MEDIAN_SAMPLE_COUNT 30
+#define TDS_SAMPLE_INTERVAL_MS  40
 
 /* Cubic polynomial coefficients (DFRobot Gravity TDS) */
 #define TDS_CUBIC_C3  133.42f
@@ -143,13 +149,8 @@ float tds_sensor_read_voltage(void)
 
 /* -------------------------------------------------------------------------- */
 
-float tds_sensor_read_tds(float temperature_c)
+static float voltage_to_tds(float voltage, float temperature_c)
 {
-    float v_sensor = tds_sensor_read_voltage();
-    if (v_sensor < 0.0f) {
-        return v_sensor;   /* propagate error */
-    }
-
     /*
      * Temperature compensation of voltage (DFRobot model):
      *   V_comp = V_sensor / (1.0 + k * (T - 25.0))
@@ -157,7 +158,7 @@ float tds_sensor_read_tds(float temperature_c)
      * The DFRobot Gravity TDS sensor output drifts with temperature;
      * this compensation normalizes to the 25 °C reference.
      */
-    float v_comp = v_sensor / (1.0f + TDS_TEMP_COMP_COEFF * (temperature_c - 25.0f));
+    float v_comp = voltage / (1.0f + TDS_TEMP_COMP_COEFF * (temperature_c - 25.0f));
 
     /*
      * Cubic polynomial TDS calculation (DFRobot Gravity TDS):
@@ -174,10 +175,70 @@ float tds_sensor_read_tds(float temperature_c)
 
     ESP_LOGI(TAG, "V_sensor=%.4f V, V_comp=%.4f V, TDS_raw=%.1f ppm, "
              "TDS_cal=%.1f ppm (T=%.1f °C)",
-             (double)v_sensor, (double)v_comp,
+             (double)voltage, (double)v_comp,
              (double)tds_raw, (double)tds_cal, (double)temperature_c);
 
     return tds_cal;
+}
+
+float tds_sensor_read_tds_filtered(float temperature_c, float *filtered_voltage_out)
+{
+    int samples[TDS_MEDIAN_SAMPLE_COUNT];
+    if (filtered_voltage_out) *filtered_voltage_out = -1.0f;
+    if (!s_initialized || !s_adc1_handle) {
+        ESP_LOGE(TAG, "Sensor not initialized — call tds_sensor_init() first");
+        return -1.0f;
+    }
+
+    /* Collect a fixed window without heap allocation. Each wait is 40 ms,
+     * well above this project's 10 ms FreeRTOS tick. */
+    for (int index = 0; index < TDS_MEDIAN_SAMPLE_COUNT; ++index) {
+        int raw = 0;
+        esp_err_t err = adc_oneshot_read(s_adc1_handle, TDS_ADC_CHANNEL, &raw);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "ADC sample %d/%d failed: %s", index + 1,
+                     TDS_MEDIAN_SAMPLE_COUNT, esp_err_to_name(err));
+            return -1.0f;
+        }
+        samples[index] = raw;
+        if (index + 1 < TDS_MEDIAN_SAMPLE_COUNT) {
+            vTaskDelay(pdMS_TO_TICKS(TDS_SAMPLE_INTERVAL_MS));
+        }
+    }
+
+    /* In-place insertion sort; 30 elements keep work and stack bounded. */
+    for (int index = 1; index < TDS_MEDIAN_SAMPLE_COUNT; ++index) {
+        const int value = samples[index];
+        int position = index;
+        while (position > 0 && samples[position - 1] > value) {
+            samples[position] = samples[position - 1];
+            --position;
+        }
+        samples[position] = value;
+    }
+
+    /* Even sample count: average the two central ADC counts. */
+    const float median_raw =
+        ((float)samples[TDS_MEDIAN_SAMPLE_COUNT / 2 - 1] +
+         (float)samples[TDS_MEDIAN_SAMPLE_COUNT / 2]) * 0.5f;
+    float voltage = median_raw * (TDS_ADC_REF_VOLTAGE / TDS_ADC_MAX_READING);
+#ifdef TDS_USE_VOLTAGE_DIVIDER
+    voltage *= TDS_DIVIDER_FACTOR;
+#endif
+    if (filtered_voltage_out) *filtered_voltage_out = voltage;
+
+    return voltage_to_tds(voltage, temperature_c);
+}
+
+float tds_sensor_read_tds(float temperature_c)
+{
+    return tds_sensor_read_tds_filtered(temperature_c, NULL);
+}
+
+float tds_sensor_ec_from_tds(float tds_ppm)
+{
+    if (tds_ppm < 0.0f) return tds_ppm;
+    return tds_ppm / g_tds_to_ec_factor;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -189,7 +250,7 @@ float tds_sensor_read_ec(float temperature_c)
         return tds;   /* propagate error */
     }
 
-    float ec = tds / g_tds_to_ec_factor;
+    float ec = tds_sensor_ec_from_tds(tds);
 
     ESP_LOGI(TAG, "EC: %.3f mS/cm (TDS: %.1f ppm, factor: %.1f)",
              (double)ec, (double)tds, (double)g_tds_to_ec_factor);

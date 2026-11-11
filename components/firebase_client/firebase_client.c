@@ -6,7 +6,7 @@
  * Flow:
  *   1. Init NVS, netif, event loop, Wi-Fi STA with auto-reconnect
  *   2. Authenticate via Firebase Auth REST API → obtain idToken
- *   3. Refresh idToken every 50 min via esp_timer
+ *   3. Refresh idToken every 50 min in a dedicated HTTPS task
  *   4. PUT telemetry / POST logs on demand
  *   5. SSE config stream in a persistent background task
  *
@@ -30,7 +30,6 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
-#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -43,6 +42,12 @@
 
 static const char *TAG = "firebase";
 
+/* Public GTS R1-R4 root CAs, embedded as NUL-terminated PEM. Standard mbedTLS
+ * chain verification supports cross-signed Google chains without the optional
+ * IDF 6.0.x bundle callback. Hostname verification remains enabled.
+ * See TLS_CERTIFICATES.md for provenance and maintenance. */
+extern const char firebase_google_roots[] asm("_binary_google_roots_pem_start");
+
 /* FreeRTOS event group bits */
 #define WIFI_CONNECTED_BIT  BIT0
 #define WIFI_FAIL_BIT       BIT1
@@ -50,10 +55,12 @@ static const char *TAG = "firebase";
 
 #define WIFI_MAX_RETRY      5
 #define WIFI_RETRY_DELAY_MS 3000
+#define WIFI_CONNECT_TIMEOUT_MS 90000
 
 /* HTTP buffer sizes */
 #define HTTP_RX_BUF_SIZE    2048
-#define HTTP_TX_BUF_SIZE    1024
+#define HTTP_RESPONSE_MAX   8192
+#define HTTP_TX_BUF_SIZE    2048 /* request line includes an Auth token */
 #define SSE_RX_BUF_SIZE     4096
 
 /* SSE reconnect delay (ms) */
@@ -69,10 +76,10 @@ static const char *TAG = "firebase";
 
 static EventGroupHandle_t s_event_group = NULL;
 static char     s_id_token[1024]     = {0};
-static char     s_device_id[16]      = {0};
+static char     s_device_id[32]      = {0};
 static int      s_wifi_retry         = 0;
 static bool     s_authenticated      = false;
-static esp_timer_handle_t s_token_timer = NULL;
+static TaskHandle_t s_token_refresh_task = NULL;
 
 /* SSE stream */
 static TaskHandle_t         s_sse_task      = NULL;
@@ -83,21 +90,17 @@ static volatile bool        s_sse_running   = false;
 /* Forward Declarations                                                       */
 /* -------------------------------------------------------------------------- */
 
-static void token_refresh_cb(void *arg);
+static void token_refresh_task_fn(void *arg);
 static void sse_task_fn(void *arg);
 static int  firebase_authenticate(void);
 
 /* -------------------------------------------------------------------------- */
-/* MAC Address → Device ID                                                     */
+/* Stable Device ID                                                            */
 /* -------------------------------------------------------------------------- */
 
 static void fetch_device_id(void)
 {
-    uint8_t mac[6];
-    esp_efuse_mac_get_default(mac);
-    snprintf(s_device_id, sizeof(s_device_id),
-             "%02X%02X%02X%02X%02X%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    snprintf(s_device_id, sizeof(s_device_id), "%s", FIREBASE_DEVICE_ID);
     ESP_LOGI(TAG, "Device ID: %s", s_device_id);
 }
 
@@ -114,6 +117,12 @@ const char *firebase_get_token(void)
 bool firebase_is_ready(void)
 {
     return s_authenticated && s_id_token[0] &&
+           firebase_wifi_is_connected();
+}
+
+bool firebase_wifi_is_connected(void)
+{
+    return s_event_group &&
            (xEventGroupGetBits(s_event_group) & WIFI_CONNECTED_BIT);
 }
 
@@ -171,10 +180,9 @@ static int wifi_init_sta(void)
 {
     /* Initialise NVS (required by Wi-Fi stack) */
     esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
-        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
-        nvs_flash_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "NVS init failed: %s (saved control settings preserved)", esp_err_to_name(ret));
+        return ret;
     }
 
     /* Create event group before registering handlers */
@@ -204,6 +212,10 @@ static int wifi_init_sta(void)
     strncpy((char *)wifi_cfg.sta.ssid,     WIFI_SSID, sizeof(wifi_cfg.sta.ssid) - 1);
     strncpy((char *)wifi_cfg.sta.password, WIFI_PASS, sizeof(wifi_cfg.sta.password) - 1);
     wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    /* Several APs share this SSID. Inspect all channels, then try the
+     * strongest matching AP first instead of the first one discovered. */
+    wifi_cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    wifi_cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
@@ -216,7 +228,7 @@ static int wifi_init_sta(void)
         s_event_group,
         WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
         pdFALSE, pdFALSE,
-        pdMS_TO_TICKS(30000));
+        pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
 
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "Wi-Fi connected");
@@ -244,24 +256,54 @@ static int wifi_init_sta(void)
  * @param body    JSON body string (NULL for GET).
  * @return Parsed cJSON object, or NULL on failure.
  */
+typedef struct {
+    char *data;
+    size_t length;
+    bool overflow;
+} http_response_t;
+
+/* perform() consumes the body. Capture chunks while it is running, including
+ * chunked transfer responses. Never log response bodies (Auth contains secrets). */
+static esp_err_t capture_http_response(esp_http_client_event_t *event)
+{
+    http_response_t *response = event->user_data;
+    if (event->event_id == HTTP_EVENT_ON_DATA && event->data_len > 0) {
+        size_t size = (size_t)event->data_len;
+        if (size >= HTTP_RESPONSE_MAX - response->length) {
+            response->overflow = true;
+            return ESP_FAIL;
+        }
+        memcpy(response->data + response->length, event->data, size);
+        response->length += size;
+        response->data[response->length] = '\0';
+    }
+    return ESP_OK;
+}
+
 static cJSON *http_json_request(const char *url,
                                 esp_http_client_method_t method,
-                                const char *body)
+                                const char *body, int *http_status)
 {
+    if (http_status) *http_status = 0;
+    http_response_t response = {.data = calloc(1, HTTP_RESPONSE_MAX)};
+    if (!response.data) return NULL;
+
     esp_http_client_config_t http_cfg = {
         .url                  = url,
         .method               = method,
         .timeout_ms           = 10000,
         .buffer_size          = HTTP_RX_BUF_SIZE,
         .buffer_size_tx       = HTTP_TX_BUF_SIZE,
-        /* TODO(security): In production, use .cert_pem with a root CA bundle
-         * or .crt_bundle_attach = esp_crt_bundle_attach. */
-        .skip_cert_common_name_check = true,
+        .cert_pem             = firebase_google_roots,
+        .event_handler        = capture_http_response,
+        .user_data            = &response,
+        .disable_auto_redirect = true,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
     if (!client) {
-        ESP_LOGE(TAG, "Failed to init HTTP client for %s", url);
+        ESP_LOGE(TAG, "Failed to init HTTP client");
+        free(response.data);
         return NULL;
     }
 
@@ -276,48 +318,35 @@ static cJSON *http_json_request(const char *url,
 
     /* Perform request */
     esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    if (http_status) *http_status = status;
+    ESP_LOGI(TAG, "REST %s HTTP %d (%s)",
+             method == HTTP_METHOD_PUT ? "PUT" :
+             method == HTTP_METHOD_POST ? "POST" : "GET",
+             status, esp_err_to_name(err));
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "HTTP request failed: %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
+        free(response.data);
         return NULL;
     }
 
-    int status = esp_http_client_get_status_code(client);
-    int content_len = esp_http_client_get_content_length(client);
-
-    ESP_LOGD(TAG, "HTTP %d, Content-Length: %d", status, content_len);
-
-    if (status < 200 || status >= 300) {
-        ESP_LOGW(TAG, "HTTP error %d for %s", status, url);
+    if (status < 200 || status >= 300 || response.overflow) {
+        ESP_LOGW(TAG, "HTTP response rejected: status=%d overflow=%d",
+                 status, response.overflow);
         esp_http_client_cleanup(client);
+        free(response.data);
         return NULL;
     }
-
-    /* Read response body */
-    char *rx_buf = malloc(HTTP_RX_BUF_SIZE);
-    if (!rx_buf) {
-        esp_http_client_cleanup(client);
-        return NULL;
-    }
-    memset(rx_buf, 0, HTTP_RX_BUF_SIZE);
-
-    int total = 0;
-    int read_len = 0;
-    while ((read_len = esp_http_client_read(client, rx_buf + total,
-                                            HTTP_RX_BUF_SIZE - total - 1)) > 0) {
-        total += read_len;
-        if (total >= HTTP_RX_BUF_SIZE - 1) break;
-    }
-    rx_buf[total] = '\0';
 
     esp_http_client_cleanup(client);
 
-    cJSON *json = cJSON_Parse(rx_buf);
+    cJSON *json = cJSON_Parse(response.data);
     if (!json) {
-        ESP_LOGE(TAG, "JSON parse error: %s", cJSON_GetErrorPtr());
+        ESP_LOGE(TAG, "Invalid or empty JSON response");
     }
 
-    free(rx_buf);
+    free(response.data);
     return json;
 }
 
@@ -339,7 +368,7 @@ static int firebase_authenticate(void)
 
     ESP_LOGI(TAG, "Authenticating with Firebase…");
 
-    cJSON *json = http_json_request(auth_url, HTTP_METHOD_POST, auth_body);
+    cJSON *json = http_json_request(auth_url, HTTP_METHOD_POST, auth_body, NULL);
     if (!json) {
         ESP_LOGE(TAG, "Firebase authentication failed");
         return ESP_FAIL;
@@ -347,8 +376,9 @@ static int firebase_authenticate(void)
 
     /* Extract idToken */
     cJSON *token = cJSON_GetObjectItem(json, "idToken");
-    if (!token || !cJSON_IsString(token)) {
-        ESP_LOGE(TAG, "idToken not found in auth response");
+    if (!cJSON_IsString(token) || !token->valuestring[0] ||
+        strlen(token->valuestring) >= sizeof(s_id_token)) {
+        ESP_LOGE(TAG, "Auth token missing, empty or exceeds client capacity");
         cJSON_Delete(json);
         return ESP_FAIL;
     }
@@ -371,34 +401,32 @@ static int firebase_authenticate(void)
 }
 
 /* -------------------------------------------------------------------------- */
-/* Token Refresh Timer                                                         */
+/* Token Refresh Task                                                          */
 /* -------------------------------------------------------------------------- */
 
-static void token_refresh_cb(void *arg)
+static void token_refresh_task_fn(void *arg)
 {
-    ESP_LOGI(TAG, "Refreshing Firebase ID token…");
-    if (firebase_authenticate() != 0) {
-        ESP_LOGE(TAG, "Token refresh failed — will retry at next interval");
-    } else {
-        ESP_LOGI(TAG, "Token refreshed successfully");
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(FIREBASE_TOKEN_REFRESH_MIN * 60 * 1000));
+        ESP_LOGI(TAG, "Refreshing Firebase ID token…");
+        if (firebase_authenticate() != 0) {
+            ESP_LOGE(TAG, "Token refresh failed — will retry at next interval");
+        } else {
+            ESP_LOGI(TAG, "Token refreshed successfully");
+        }
     }
 }
 
-static void start_token_refresh_timer(void)
+static esp_err_t start_token_refresh_task(void)
 {
-    const esp_timer_create_args_t timer_args = {
-        .callback = &token_refresh_cb,
-        .arg      = NULL,
-        .name     = "token_refresh",
-    };
-    esp_timer_create(&timer_args, &s_token_timer);
-
-    /* Fire every 50 minutes (in microseconds) */
-    uint64_t interval_us = (uint64_t)FIREBASE_TOKEN_REFRESH_MIN * 60ULL * 1000000ULL;
-    esp_timer_start_periodic(s_token_timer, interval_us);
-
-    ESP_LOGI(TAG, "Token refresh timer started (interval: %d min)",
-             FIREBASE_TOKEN_REFRESH_MIN);
+    if (s_token_refresh_task) return ESP_OK;
+    if (xTaskCreate(token_refresh_task_fn, "token_refresh", 12288, NULL,
+                    tskIDLE_PRIORITY + 1, &s_token_refresh_task) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create token refresh task");
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "Token refresh task started (interval: %d min)", FIREBASE_TOKEN_REFRESH_MIN);
+    return ESP_OK;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -407,6 +435,12 @@ static void start_token_refresh_timer(void)
 
 int firebase_put_telemetry(const char *json_payload)
 {
+    return firebase_put_telemetry_with_status(json_payload, NULL);
+}
+
+int firebase_put_telemetry_with_status(const char *json_payload, int *http_status)
+{
+    if (http_status) *http_status = 0;
     if (!s_authenticated || !s_id_token[0]) {
         ESP_LOGE(TAG, "Cannot PUT — not authenticated");
         return ESP_ERR_INVALID_STATE;
@@ -414,10 +448,10 @@ int firebase_put_telemetry(const char *json_payload)
 
     char url[URL_BUF_SIZE];
     snprintf(url, sizeof(url),
-             "https://%s/devices/%s/live.json?auth=%s",
-             FIREBASE_HOST, s_device_id, s_id_token);
+             "https://%s/%s/%s/live.json?auth=%s",
+             FIREBASE_HOST, FIREBASE_DEVICE_ROOT, s_device_id, s_id_token);
 
-    cJSON *resp = http_json_request(url, HTTP_METHOD_PUT, json_payload);
+    cJSON *resp = http_json_request(url, HTTP_METHOD_PUT, json_payload, http_status);
 
     /* PUT to live.json returns the stored data — we can ignore the body
      * as long as the HTTP status was 2xx (already checked in http_json_request) */
@@ -433,7 +467,7 @@ int firebase_put_telemetry(const char *json_payload)
 
 /* -------------------------------------------------------------------------- */
 
-int firebase_post_log(const char *json_payload)
+int firebase_post_history(const char *json_payload)
 {
     if (!s_authenticated || !s_id_token[0]) {
         ESP_LOGE(TAG, "Cannot POST — not authenticated");
@@ -442,20 +476,56 @@ int firebase_post_log(const char *json_payload)
 
     char url[URL_BUF_SIZE];
     snprintf(url, sizeof(url),
-             "https://%s/devices/%s/logs.json?auth=%s",
-             FIREBASE_HOST, s_device_id, s_id_token);
+             "https://%s/%s/%s/history.json?auth=%s",
+             FIREBASE_HOST, FIREBASE_DEVICE_ROOT, s_device_id, s_id_token);
 
-    cJSON *resp = http_json_request(url, HTTP_METHOD_POST, json_payload);
+    cJSON *resp = http_json_request(url, HTTP_METHOD_POST, json_payload, NULL);
 
     /* POST returns {"name":"-<unique_key>"} — we can inspect the key if
      * needed, but for now just confirm success. */
     if (resp) {
+        const cJSON *key = cJSON_GetObjectItemCaseSensitive(resp, "name");
+        if (cJSON_IsString(key)) {
+            ESP_LOGI(TAG, "History key (for selective cleanup): %s", key->valuestring);
+        }
         cJSON_Delete(resp);
-        ESP_LOGI(TAG, "Log POST successful");
+        ESP_LOGI(TAG, "History POST successful");
         return 0;
     }
 
-    ESP_LOGE(TAG, "Log POST failed");
+    ESP_LOGE(TAG, "History POST failed");
+    return ESP_FAIL;
+}
+
+/* -------------------------------------------------------------------------- */
+
+int firebase_put_heartbeat(void)
+{
+    return firebase_put_heartbeat_with_status(NULL);
+}
+
+int firebase_put_heartbeat_with_status(int *http_status)
+{
+    if (http_status) *http_status = 0;
+    if (!s_authenticated || !s_id_token[0]) {
+        ESP_LOGE(TAG, "Cannot update heartbeat — not authenticated");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char url[URL_BUF_SIZE];
+    snprintf(url, sizeof(url),
+             "https://%s/%s/%s/heartbeat.json?auth=%s",
+             FIREBASE_HOST, FIREBASE_DEVICE_ROOT, s_device_id, s_id_token);
+
+    const char *payload = "{\"last_seen_ms\":{\".sv\":\"timestamp\"}}";
+    cJSON *resp = http_json_request(url, HTTP_METHOD_PUT, payload, http_status);
+    if (resp) {
+        cJSON_Delete(resp);
+        ESP_LOGI(TAG, "Heartbeat PUT successful");
+        return 0;
+    }
+
+    ESP_LOGE(TAG, "Heartbeat PUT failed");
     return ESP_FAIL;
 }
 
@@ -467,10 +537,10 @@ static void sse_task_fn(void *arg)
 {
     char url[URL_BUF_SIZE];
     snprintf(url, sizeof(url),
-             "https://%s/devices/%s/config.json?auth=%s",
-             FIREBASE_HOST, s_device_id, s_id_token);
+             "https://%s/%s/%s/config.json?auth=%s",
+             FIREBASE_HOST, FIREBASE_DEVICE_ROOT, s_device_id, s_id_token);
 
-    ESP_LOGI(TAG, "SSE config stream starting — %s", url);
+    ESP_LOGI(TAG, "SSE config stream starting for device %s", s_device_id);
 
     char *rx_buf = malloc(SSE_RX_BUF_SIZE);
     if (!rx_buf) {
@@ -490,8 +560,8 @@ static void sse_task_fn(void *arg)
 
         /* Rebuild URL with current token */
         snprintf(url, sizeof(url),
-                 "https://%s/devices/%s/config.json?auth=%s",
-                 FIREBASE_HOST, s_device_id, s_id_token);
+                 "https://%s/%s/%s/config.json?auth=%s",
+                 FIREBASE_HOST, FIREBASE_DEVICE_ROOT, s_device_id, s_id_token);
 
         esp_http_client_config_t http_cfg = {
             .url             = url,
@@ -499,7 +569,8 @@ static void sse_task_fn(void *arg)
             .timeout_ms      = 0,             /* no timeout — persistent */
             .keep_alive_enable = true,
             .buffer_size     = HTTP_RX_BUF_SIZE,
-            .skip_cert_common_name_check = true,
+            .buffer_size_tx  = HTTP_TX_BUF_SIZE,
+            .cert_pem        = firebase_google_roots,
         };
 
         esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
@@ -522,7 +593,15 @@ static void sse_task_fn(void *arg)
         }
 
         int content_len = esp_http_client_fetch_headers(client);
-        ESP_LOGI(TAG, "SSE connected — Content-Length: %d", content_len);
+        const int status = esp_http_client_get_status_code(client);
+        if (status != 200) {
+            ESP_LOGW(TAG, "SSE: HTTP %d (headers=%d) — reconnecting", status, content_len);
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+            vTaskDelay(pdMS_TO_TICKS(SSE_RECONNECT_MS));
+            continue;
+        }
+        ESP_LOGI(TAG, "SSE connected — HTTP 200, Content-Length: %d", content_len);
 
         /* Read SSE data in a loop */
         int buf_pos = 0;
@@ -530,12 +609,27 @@ static void sse_task_fn(void *arg)
             int rd = esp_http_client_read(client,
                                           rx_buf + buf_pos,
                                           SSE_RX_BUF_SIZE - buf_pos - 1);
+            if (rd == -ESP_ERR_HTTP_EAGAIN) {
+                /* Idle SSE stream is normal. Reconnect only when Wi-Fi is down. */
+                if (!(xEventGroupGetBits(s_event_group) & WIFI_CONNECTED_BIT)) break;
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
             if (rd <= 0) {
                 ESP_LOGW(TAG, "SSE: read returned %d — reconnecting…", rd);
                 break;   /* connection lost — reconnect */
             }
 
             buf_pos += rd;
+            rx_buf[buf_pos] = '\0';
+
+            /* RTDB SSE may use CRLF; normalize before searching for the
+             * blank-line event separator, including split read boundaries. */
+            int normalized = 0;
+            for (int i = 0; i < buf_pos; ++i) {
+                if (rx_buf[i] != '\r') rx_buf[normalized++] = rx_buf[i];
+            }
+            buf_pos = normalized;
             rx_buf[buf_pos] = '\0';
 
             /* Parse complete SSE events from the buffer.
@@ -603,7 +697,7 @@ firebase_sse_handle_t firebase_start_config_stream(firebase_config_cb_t cb)
     s_sse_running = true;
 
     BaseType_t ret = xTaskCreate(&sse_task_fn, "sse_stream",
-                                 4096, NULL, tskIDLE_PRIORITY + 1,
+                                 12288, NULL, tskIDLE_PRIORITY + 1,
                                  &s_sse_task);
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create SSE task");
@@ -645,8 +739,9 @@ int firebase_client_init(void)
         return ret;
     }
 
-    /* Start periodic token refresh */
-    start_token_refresh_timer();
+    /* HTTPS must not run on the small esp_timer callback-task stack. */
+    ret = start_token_refresh_task();
+    if (ret != ESP_OK) return ret;
 
     ESP_LOGI(TAG, "Firebase client ready");
     return 0;

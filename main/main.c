@@ -11,33 +11,55 @@
  */
 
 /* =========================================================================
- * Optional: uncomment to run full system diagnostics on boot.
- * When defined, the diagnostic sequence runs BEFORE any FreeRTOS task is
- * spawned, blocking until all hardware checks pass.
+ * Bench mode selector: runs at the top of app_main() and does not start the
+ * normal control/actuator tasks. Enable at most one mode for bench testing.
  * ========================================================================= */
-/* #define RUN_DIAGNOSTIC_TESTS */
+/* #define RUN_BENCH_LCD_WIFI */
+/* #define RUN_BENCH_FIREBASE_SIM */
+/* #define RUN_BENCH_TEMP_SENSOR */
+/* #define RUN_BENCH_TDS_SENSOR */
+/* #define RUN_BENCH_PH_SENSOR */
+/* #define RUN_BENCH_ALL_SENSORS */
+/* #define RUN_BENCH_RELAY */
+
+#if (defined(RUN_BENCH_LCD_WIFI) + defined(RUN_BENCH_FIREBASE_SIM) + \
+     defined(RUN_BENCH_TEMP_SENSOR) + defined(RUN_BENCH_TDS_SENSOR) + \
+     defined(RUN_BENCH_PH_SENSOR) + defined(RUN_BENCH_ALL_SENSORS) + \
+     defined(RUN_BENCH_RELAY)) > 1
+#error "Select only one bench mode"
+#endif
 
 /* -------------------------------------------------------------------------- */
 /* Includes                                                                   */
 /* -------------------------------------------------------------------------- */
 
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "cJSON.h"
 #include "driver/gpio.h"
-#include "esp_adc/adc_oneshot.h"
 #include "esp_err.h"
 #include "esp_log.h"
-#include "esp_rom_sys.h"
+#include "esp_netif_sntp.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 
 #include "actuators.h"
+#include "bench_test.h"
+#include "bench_firebase_sim.h"
+#include "bench_temp_sensor.h"
+#include "bench_tds_sensor.h"
+#include "bench_ph_sensor.h"
+#include "bench_all_sensors.h"
+#include "bench_relay.h"
 #include "firebase_client.h"
 #include "fuzzy_control.h"
 #include "lcd_display.h"
@@ -52,21 +74,22 @@ static const char *TAG = "aquaharu";
 /* -------------------------------------------------------------------------- */
 
 struct SensorData {
-    float pH;
-    float ec;
-    float tds;
-    float temperature;
-    float light;
-    bool  waterLow;
+    float ph;
+    float ec_ms_cm;
+    float tds_ppm;
+    float temperature_c;
+    bool  light_do_high;
+    bool  water_low;
+    bool  valid;
 };
 
 struct SystemConfig {
-    float sp_pH;
-    float sp_ec;
-    float sp_temp;
-    bool  auto_enabled;
-    int   auto_off_hour;
-    int   auto_on_hour;
+    float setpoint_ph;
+    float setpoint_ec_ms_cm;
+    float setpoint_temperature_c;
+    bool  automation_enabled;
+    int   schedule_off_hour;
+    int   schedule_on_hour;
 };
 
 struct ActCmd {
@@ -79,16 +102,147 @@ struct ActCmd {
 /* Global instances */
 static struct SensorData   g_sensor = {0};
 static struct SystemConfig g_config = {
-    .sp_pH        = 6.5f,
-    .sp_ec        = 1.5f,
-    .sp_temp      = 25.0f,
-    .auto_enabled = true,
+    .setpoint_ph             = 6.5f,
+    .setpoint_ec_ms_cm       = 1.5f,
+    .setpoint_temperature_c  = 25.0f,
+    .automation_enabled      = false, /* OFF until a saved or remote config is loaded */
+    .schedule_off_hour       = 21,
+    .schedule_on_hour        = 6,
 };
 
 /* Synchronisation primitives */
 static SemaphoreHandle_t s_sensor_mutex = NULL;
 static SemaphoreHandle_t s_config_mutex = NULL;
 static QueueHandle_t     s_q_act        = NULL;
+static bool              s_nvs_ready   = false;
+
+/* Persist only validated control settings. No Firebase credentials are stored here. */
+#define CONTROL_CONFIG_VERSION 1U
+typedef struct {
+    uint32_t version;
+    float setpoint_ph;
+    float setpoint_ec_ms_cm;
+    float setpoint_temperature_c;
+    uint8_t automation_enabled;
+    uint8_t schedule_on_hour;
+    uint8_t schedule_off_hour;
+    uint8_t reserved;
+} saved_config_t;
+
+static void load_control_config(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS init failed (%s); automation starts OFF", esp_err_to_name(err));
+        return;
+    }
+    s_nvs_ready = true;
+
+    nvs_handle_t handle;
+    err = nvs_open("aquaharu", NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGI(TAG, "No saved control config; automation starts OFF");
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Cannot open saved config: %s", esp_err_to_name(err));
+        return;
+    }
+
+    saved_config_t saved = {0};
+    size_t size = sizeof(saved);
+    err = nvs_get_blob(handle, "control", &saved, &size);
+    nvs_close(handle);
+    if (err != ESP_OK || size != sizeof(saved) ||
+        saved.version != CONTROL_CONFIG_VERSION ||
+        !isfinite(saved.setpoint_ph) || saved.setpoint_ph < 4 || saved.setpoint_ph > 8 ||
+        !isfinite(saved.setpoint_ec_ms_cm) || saved.setpoint_ec_ms_cm < 0.5f || saved.setpoint_ec_ms_cm > 3.5f ||
+        !isfinite(saved.setpoint_temperature_c) || saved.setpoint_temperature_c < 18 || saved.setpoint_temperature_c > 30 ||
+        saved.automation_enabled > 1 || saved.schedule_on_hour > 23 || saved.schedule_off_hour > 23) {
+        ESP_LOGW(TAG, "Saved control config missing or invalid; automation starts OFF");
+        return;
+    }
+
+    g_config.setpoint_ph = saved.setpoint_ph;
+    g_config.setpoint_ec_ms_cm = saved.setpoint_ec_ms_cm;
+    g_config.setpoint_temperature_c = saved.setpoint_temperature_c;
+    g_config.automation_enabled = saved.automation_enabled != 0;
+    g_config.schedule_on_hour = saved.schedule_on_hour;
+    g_config.schedule_off_hour = saved.schedule_off_hour;
+    ESP_LOGI(TAG, "Restored local config: automation=%s, pH=%.2f EC=%.2f T=%.1f schedule=%02u-%02u WIB",
+             g_config.automation_enabled ? "ON" : "OFF", (double)g_config.setpoint_ph,
+             (double)g_config.setpoint_ec_ms_cm, (double)g_config.setpoint_temperature_c,
+             (unsigned)saved.schedule_on_hour, (unsigned)saved.schedule_off_hour);
+}
+
+static void save_control_config(const struct SystemConfig *config)
+{
+    if (!s_nvs_ready) return;
+    const saved_config_t saved = {
+        .version = CONTROL_CONFIG_VERSION,
+        .setpoint_ph = config->setpoint_ph,
+        .setpoint_ec_ms_cm = config->setpoint_ec_ms_cm,
+        .setpoint_temperature_c = config->setpoint_temperature_c,
+        .automation_enabled = config->automation_enabled ? 1 : 0,
+        .schedule_on_hour = (uint8_t)config->schedule_on_hour,
+        .schedule_off_hour = (uint8_t)config->schedule_off_hour,
+        .reserved = 0,
+    };
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("aquaharu", NVS_READWRITE, &handle);
+    if (err == ESP_OK) {
+        err = nvs_set_blob(handle, "control", &saved, sizeof(saved));
+        if (err == ESP_OK) err = nvs_commit(handle);
+        nvs_close(handle);
+    }
+    if (err != ESP_OK) ESP_LOGE(TAG, "Failed to save local config: %s", esp_err_to_name(err));
+    else ESP_LOGI(TAG, "Control config saved locally for offline operation");
+}
+
+/* Control schedule uses WIB (UTC+7). With no valid clock, the last saved
+ * automation switch runs locally; time scheduling resumes after NTP sync. */
+static bool automation_allowed(struct SystemConfig *snapshot)
+{
+    struct SystemConfig config;
+    if (xSemaphoreTake(s_config_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+    config = g_config;
+    xSemaphoreGive(s_config_mutex);
+    if (snapshot) *snapshot = config;
+    if (!config.automation_enabled) return false;
+
+    const time_t now = time(NULL);
+    if (now < (time_t)1704067200) {
+        static bool warned_no_clock = false;
+        if (!warned_no_clock) {
+            ESP_LOGW(TAG, "Clock unavailable: using saved automation switch; WIB schedule suspended until time sync");
+            warned_no_clock = true;
+        }
+        return true;
+    }
+    const time_t wib = now + 7 * 3600;
+    struct tm local;
+    if (!gmtime_r(&wib, &local)) return false;
+    const int hour = local.tm_hour;
+    const int start = config.schedule_on_hour;
+    const int stop = config.schedule_off_hour;
+    if (start == stop) return true; /* equal hours mean 24-hour operation */
+    return start < stop ? (hour >= start && hour < stop)
+                        : (hour >= start || hour < stop);
+}
+
+/* RTDB resolves this REST placeholder to its authoritative Unix timestamp
+ * in milliseconds when it stores the payload. */
+static void add_server_timestamp(cJSON *object, const char *field_name)
+{
+    cJSON *server_value = cJSON_CreateObject();
+    if (!server_value) return;
+
+    if (!cJSON_AddStringToObject(server_value, ".sv", "timestamp")) {
+        cJSON_Delete(server_value);
+        return;
+    }
+    cJSON_AddItemToObject(object, field_name, server_value);
+}
 
 /* -------------------------------------------------------------------------- */
 /* Forward Declarations (FreeRTOS tasks)                                      */
@@ -99,478 +253,36 @@ static void task_control(void *pv);
 static void task_actuator(void *pv);
 static void task_upload(void *pv);
 static void task_display(void *pv);
+static void task_comms_start(void *pv);
 
 /* -------------------------------------------------------------------------- */
-/* LDR Light Sensor Helper (GPIO 34 / ADC1_CH6 — no dedicated component)      */
+/* Digital LDR (GPIO 34): HIGH = bright on the tested device_01 module.       */
 /* -------------------------------------------------------------------------- */
 
-#define LDR_ADC_UNIT    ADC_UNIT_1
-#define LDR_ADC_CHANNEL ADC_CHANNEL_6
-#define LDR_ADC_ATTEN   ADC_ATTEN_DB_12
-#define LDR_ADC_WIDTH   ADC_BITWIDTH_12
-
-/**
- * @brief Read raw LDR voltage.  Must be called after ph_sensor_init() so
- *        that the ADC1 handle exists and channel 6 can be configured.
- */
-static float ldr_read_voltage(void)
+static bool ldr_read_high(void)
 {
-    adc_oneshot_unit_handle_t handle = ph_sensor_get_adc_handle();
-    if (!handle) {
-        ESP_LOGE(TAG, "LDR: ADC1 handle not available — call ph_sensor_init() first");
-        return -1.0f;
-    }
+    return gpio_get_level(GPIO_NUM_34) == 1;
+}
 
-    /* Configure channel 6 on the existing ADC1 handle (idempotent) */
-    adc_oneshot_chan_cfg_t chan_cfg = {
-        .atten    = LDR_ADC_ATTEN,
-        .bitwidth = LDR_ADC_WIDTH,
-    };
-    esp_err_t ret = adc_oneshot_config_channel(handle, LDR_ADC_CHANNEL, &chan_cfg);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "LDR: channel config failed: %s", esp_err_to_name(ret));
-        return -1.0f;
-    }
+/* Two-point mapping used in the successful sensor bench. Reconfirm the
+ * pH 4.01 voltage with the final analog wiring before automatic dosing. */
+#define PH_V_686 2.736f
+#define PH_V_401 3.130f
 
-    int raw = 0;
-    ret = adc_oneshot_read(handle, LDR_ADC_CHANNEL, &raw);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "LDR: read failed: %s", esp_err_to_name(ret));
-        return -1.0f;
-    }
-
-    return (float)raw * (3.3f / 4095.0f);
+static bool ph_read_calibrated(float *value)
+{
+    ph_sensor_sample_t sample;
+    if (ph_sensor_read_sample(&sample) != ESP_OK ||
+        sample.raw_adc <= 5 || sample.raw_adc >= 4090) return false;
+    const float ph = 6.86f + (sample.pin_voltage_v - PH_V_686) *
+                     (4.01f - 6.86f) / (PH_V_401 - PH_V_686);
+    if (!isfinite(ph) || ph < 0.0f || ph > 14.0f) return false;
+    *value = ph;
+    return true;
 }
 
 /* ========================================================================= */
-/*  SECTION 1 — Individual Component Test Functions (Bench / Development)    */
-/* ========================================================================= */
-/*
- * Each function below runs an INFINITE LOOP with internal vTaskDelay().
- * To test a single component on a workbench, open app_main() and replace
- * the FreeRTOS task creation + diagnostic block with a call such as:
- *
- *     test_sensor_ph();
- *     return;   // or while(1) { vTaskDelay(1000); }
- *
- * This lets you validate one sensor or relay at a time without spawning
- * the full multi-tasking system.
- */
-
-/* ---- Temperature Sensor (DS18B20, GPIO 32) ---- */
-
-__attribute__((unused))
-static void test_sensor_temp(void)
-{
-    ESP_LOGI(TAG, "=== TEST: DS18B20 Temperature Sensor ===");
-
-    if (!temp_sensor_init()) {
-        ESP_LOGE(TAG, "DS18B20 init FAILED");
-        return;
-    }
-
-    while (1) {
-        float t = temp_sensor_sample();
-        if (t <= TEMP_SENSOR_NO_DEVICE) {
-            ESP_LOGE(TAG, "Temperature: READ ERROR");
-        } else {
-            ESP_LOGI(TAG, "Temperature: %.2f °C", (double)t);
-        }
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-}
-
-/* ---- pH Sensor (PH-4502C, GPIO 36 / ADC1_CH0) ---- */
-
-__attribute__((unused))
-static void test_sensor_ph(void)
-{
-    ESP_LOGI(TAG, "=== TEST: pH Sensor ===");
-
-    if (ph_sensor_init() != 0) {
-        ESP_LOGE(TAG, "pH sensor init FAILED");
-        return;
-    }
-
-    while (1) {
-        float voltage = ph_sensor_read_voltage();
-        float ph_raw  = ph_sensor_read_raw();
-        /* Use 25 °C as a fixed reference for bench testing */
-        float ph_comp = ph_sensor_read_compensated(25.0f);
-
-        ESP_LOGI(TAG, "pH — V:%.4f  raw:%.3f  comp@25°C:%.3f",
-                 (double)voltage, (double)ph_raw, (double)ph_comp);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-}
-
-/* ---- TDS / EC Sensor (GPIO 39 / ADC1_CH3) ---- */
-
-__attribute__((unused))
-static void test_sensor_tds(void)
-{
-    ESP_LOGI(TAG, "=== TEST: TDS / EC Sensor ===");
-
-    if (tds_sensor_init(ph_sensor_get_adc_handle()) != 0) {
-        ESP_LOGE(TAG, "TDS sensor init FAILED");
-        return;
-    }
-
-    while (1) {
-        /* Fixed 25 °C for bench testing */
-        float tds = tds_sensor_read_tds(25.0f);
-        float ec  = tds_sensor_read_ec(25.0f);
-
-        ESP_LOGI(TAG, "TDS: %.1f ppm  EC: %.3f mS/cm", (double)tds, (double)ec);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-}
-
-/* ---- Light Sensor (LDR, GPIO 34 / ADC1_CH6) ---- */
-
-__attribute__((unused))
-static void test_sensor_light(void)
-{
-    ESP_LOGI(TAG, "=== TEST: LDR Light Sensor ===");
-
-    if (ph_sensor_init() != 0) {
-        ESP_LOGE(TAG, "ADC1 init FAILED (required for LDR)");
-        return;
-    }
-
-    while (1) {
-        float v = ldr_read_voltage();
-        if (v < 0.0f) {
-            ESP_LOGE(TAG, "LDR: READ ERROR");
-        } else {
-            /* Higher voltage = more light (typical LDR divider circuit) */
-            float pct = (v / 3.3f) * 100.0f;
-            ESP_LOGI(TAG, "LDR — Voltage: %.4f V  Intensity: ~%.0f %%",
-                     (double)v, (double)pct);
-        }
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-}
-
-/* ---- Float Switch (GPIO 35) ---- */
-
-__attribute__((unused))
-static void test_float_switch(void)
-{
-    ESP_LOGI(TAG, "=== TEST: Float Switch (GPIO 35) ===");
-
-    /* actuators_init() configures GPIO 35 as input */
-    if (actuators_init() != 0) {
-        ESP_LOGE(TAG, "Actuators init FAILED");
-        return;
-    }
-
-    while (1) {
-        bool ok = actuators_water_ok();
-        ESP_LOGI(TAG, "Float Switch: %s (GPIO 35 = %s)",
-                 ok ? "WATER OK" : "WATER LOW",
-                 ok ? "HIGH" : "LOW");
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-}
-
-/* ---- Relay Test Helpers ---- */
-
-/** Configure a single GPIO as push-pull output and set it LOW. */
-static void relay_test_init(gpio_num_t gpio)
-{
-    gpio_config_t cfg = {
-        .pin_bit_mask = (1ULL << gpio),
-        .mode         = GPIO_MODE_OUTPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&cfg);
-    gpio_set_level(gpio, 0);
-}
-
-/** Toggle relay: ON 3 s → OFF 3 s, logging state changes. */
-__attribute__((unused))
-static void relay_test_loop(gpio_num_t gpio, const char *name)
-{
-    while (1) {
-        ESP_LOGI(TAG, "%s — ON", name);
-        gpio_set_level(gpio, 1);
-        vTaskDelay(pdMS_TO_TICKS(3000));
-
-        ESP_LOGI(TAG, "%s — OFF", name);
-        gpio_set_level(gpio, 0);
-        vTaskDelay(pdMS_TO_TICKS(3000));
-    }
-}
-
-/* ---- Individual Relay Tests ---- */
-
-__attribute__((unused))
-static void test_relay_pump_ph_up(void)
-{
-    ESP_LOGI(TAG, "=== TEST: Relay 1 — pH Up Pump (GPIO 19) ===");
-    relay_test_init(GPIO_NUM_19);
-    relay_test_loop(GPIO_NUM_19, "pH Up");
-}
-
-__attribute__((unused))
-static void test_relay_pump_ph_down(void)
-{
-    ESP_LOGI(TAG, "=== TEST: Relay 2 — pH Down Pump (GPIO 18) ===");
-    relay_test_init(GPIO_NUM_18);
-    relay_test_loop(GPIO_NUM_18, "pH Down");
-}
-
-__attribute__((unused))
-static void test_relay_pump_nut_a(void)
-{
-    ESP_LOGI(TAG, "=== TEST: Relay 3 — Nutrient A Pump (GPIO 5) ===");
-    relay_test_init(GPIO_NUM_5);
-    relay_test_loop(GPIO_NUM_5, "Nutrient A");
-}
-
-__attribute__((unused))
-static void test_relay_pump_nut_b(void)
-{
-    ESP_LOGI(TAG, "=== TEST: Relay 4 — Nutrient B Pump (GPIO 17) ===");
-    relay_test_init(GPIO_NUM_17);
-    relay_test_loop(GPIO_NUM_17, "Nutrient B");
-}
-
-__attribute__((unused))
-static void test_relay_peltier(void)
-{
-    ESP_LOGI(TAG, "=== TEST: Relay 5 — Peltier + Fan (GPIO 16) ===");
-    ESP_LOGI(TAG, "Relay 6 (Circulation Pump) will also be activated for safety");
-    relay_test_init(GPIO_NUM_16);
-    relay_test_init(GPIO_NUM_4);
-
-    while (1) {
-        ESP_LOGI(TAG, "Peltier + Circ Pump — ON");
-        gpio_set_level(GPIO_NUM_16, 1);
-        gpio_set_level(GPIO_NUM_4,  1);
-        vTaskDelay(pdMS_TO_TICKS(3000));
-
-        ESP_LOGI(TAG, "Peltier + Circ Pump — OFF");
-        gpio_set_level(GPIO_NUM_16, 0);
-        gpio_set_level(GPIO_NUM_4,  0);
-        vTaskDelay(pdMS_TO_TICKS(3000));
-    }
-}
-
-__attribute__((unused))
-static void test_relay_circulation(void)
-{
-    ESP_LOGI(TAG, "=== TEST: Relay 6 — Circulation Pump (GPIO 4) ===");
-    relay_test_init(GPIO_NUM_4);
-    relay_test_loop(GPIO_NUM_4, "Circulation Pump");
-}
-
-/* ========================================================================= */
-/*  SECTION 2 — Full System Diagnostic Test Mode                             */
-/* ========================================================================= */
-
-#ifdef RUN_DIAGNOSTIC_TESTS
-
-#define DIAG_READINGS   5
-#define DIAG_DELAY_MS   1000
-#define RELAY_ON_MS     2000
-#define RELAY_GAP_MS    1000
-
-/**
- * @brief Run a sequential diagnostic of every hardware subsystem.
- *
- * Called from app_main() before any FreeRTOS task is created.  Logs all
- * results via ESP_LOGI / ESP_LOGW / ESP_LOGE.  After completion, writes
- * "Diagnostics OK" to the LCD and returns so task creation can proceed.
- */
-static void run_full_diagnostics(void)
-{
-    int pass = 0, warn = 0, fail = 0;
-    float temp;
-
-    ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "  AQUAHARU — Full System Diagnostics");
-    ESP_LOGI(TAG, "========================================");
-
-    /* ---- 1. Temperature Sensor (DS18B20) ---- */
-    ESP_LOGI(TAG, "[1/6] DS18B20 Temperature Sensor (5 readings)");
-    if (!temp_sensor_init()) {
-        ESP_LOGE(TAG, "  DS18B20 init FAILED — check wiring & pull-up");
-        fail++;
-    } else {
-        for (int i = 0; i < DIAG_READINGS; i++) {
-            temp = temp_sensor_sample();
-            if (temp <= TEMP_SENSOR_NO_DEVICE) {
-                ESP_LOGE(TAG, "  [%d/%d] READ ERROR", i + 1, DIAG_READINGS);
-                fail++;
-            } else if (temp < 10.0f || temp > 45.0f) {
-                ESP_LOGW(TAG, "  [%d/%d] %.2f °C — out of expected range [10–45]",
-                         i + 1, DIAG_READINGS, (double)temp);
-                warn++;
-            } else {
-                ESP_LOGI(TAG, "  [%d/%d] %.2f °C — OK", i + 1, DIAG_READINGS,
-                         (double)temp);
-                pass++;
-            }
-            vTaskDelay(pdMS_TO_TICKS(DIAG_DELAY_MS));
-        }
-    }
-
-    /* ---- 2. pH Sensor ---- */
-    ESP_LOGI(TAG, "[2/6] pH Sensor (5 readings)");
-    if (ph_sensor_init() != 0) {
-        ESP_LOGE(TAG, "  pH sensor init FAILED");
-        fail++;
-    } else {
-        float temp_ref = (temp > TEMP_SENSOR_NO_DEVICE) ? temp : 25.0f;
-        for (int i = 0; i < DIAG_READINGS; i++) {
-            float ph = ph_sensor_read_compensated(temp_ref);
-            if (ph < 0.0f) {
-                ESP_LOGE(TAG, "  [%d/%d] READ ERROR", i + 1, DIAG_READINGS);
-                fail++;
-            } else if (ph < 4.0f || ph > 10.0f) {
-                ESP_LOGW(TAG, "  [%d/%d] pH %.3f — outside expected range [4.0–10.0]",
-                         i + 1, DIAG_READINGS, (double)ph);
-                warn++;
-            } else {
-                ESP_LOGI(TAG, "  [%d/%d] pH %.3f — OK", i + 1, DIAG_READINGS,
-                         (double)ph);
-                pass++;
-            }
-            vTaskDelay(pdMS_TO_TICKS(DIAG_DELAY_MS));
-        }
-    }
-
-    /* ---- 3. TDS & EC Sensor ---- */
-    ESP_LOGI(TAG, "[3/6] TDS / EC Sensor (5 readings)");
-    if (tds_sensor_init(ph_sensor_get_adc_handle()) != 0) {
-        ESP_LOGE(TAG, "  TDS sensor init FAILED");
-        fail++;
-    } else {
-        float temp_ref = (temp > TEMP_SENSOR_NO_DEVICE) ? temp : 25.0f;
-        for (int i = 0; i < DIAG_READINGS; i++) {
-            float tds = tds_sensor_read_tds(temp_ref);
-            float ec  = tds_sensor_read_ec(temp_ref);
-            if (tds < 0.0f) {
-                ESP_LOGE(TAG, "  [%d/%d] READ ERROR", i + 1, DIAG_READINGS);
-                fail++;
-            } else {
-                ESP_LOGI(TAG, "  [%d/%d] TDS: %.1f ppm  EC: %.3f mS/cm — OK",
-                         i + 1, DIAG_READINGS, (double)tds, (double)ec);
-                pass++;
-            }
-            vTaskDelay(pdMS_TO_TICKS(DIAG_DELAY_MS));
-        }
-    }
-
-    /* ---- 4. LCD Display ---- */
-    ESP_LOGI(TAG, "[4/6] LCD 20×4 Display");
-    if (lcd_init() != 0) {
-        ESP_LOGE(TAG, "  LCD init FAILED");
-        fail++;
-    } else {
-        lcd_clear();
-        lcd_set_backlight(true);
-        lcd_write_at(0, 0, "AQUAHARU DIAGNOSTIC");
-        lcd_write_at(1, 0, "LCD 20x4 Test Line 2");
-        lcd_write_at(2, 0, "Row 3: abcdefghijklmn");
-        lcd_write_at(3, 0, "Row 4: 0123456789ABCDEF");
-        ESP_LOGI(TAG, "  LCD test pattern displayed — wait 3 s");
-        vTaskDelay(pdMS_TO_TICKS(3000));
-        lcd_clear();
-        lcd_write_at(0, 2, "LCD OK");
-        pass++;
-    }
-
-    /* ---- 5. Actuators (Relay Sequential Test) ---- */
-    ESP_LOGI(TAG, "[5/6] Relay Sequential Test (2 s ON each)");
-    if (actuators_init() != 0) {
-        ESP_LOGE(TAG, "  Actuators init FAILED");
-        fail++;
-    } else if (!actuators_water_ok()) {
-        /* Float switch safety check before relay test */
-        ESP_LOGW(TAG, "  Float switch indicates LOW WATER — relay test aborted");
-        warn++;
-    } else {
-        /* Run each relay ON 2s → OFF, 1s gap between */
-        static const struct {
-            gpio_num_t gpio;
-            const char *name;
-        } relay_seq[] = {
-            { GPIO_NUM_19, "Relay 1 — pH Up"         },
-            { GPIO_NUM_18, "Relay 2 — pH Down"       },
-            { GPIO_NUM_5,  "Relay 3 — Nutrient A"    },
-            { GPIO_NUM_17, "Relay 4 — Nutrient B"    },
-            { GPIO_NUM_16, "Relay 5 — Peltier+Fan"   },
-            { GPIO_NUM_4,  "Relay 6 — Circulation"   },
-        };
-
-        for (size_t i = 0; i < sizeof(relay_seq) / sizeof(relay_seq[0]); i++) {
-            ESP_LOGI(TAG, "  %s — ON", relay_seq[i].name);
-            gpio_set_level(relay_seq[i].gpio, 1);
-
-            /* Peltier test: also turn on circulation pump for safety */
-            if (relay_seq[i].gpio == GPIO_NUM_16) {
-                gpio_set_level(GPIO_NUM_4, 1);
-            }
-
-            vTaskDelay(pdMS_TO_TICKS(RELAY_ON_MS));
-
-            gpio_set_level(relay_seq[i].gpio, 0);
-            if (relay_seq[i].gpio == GPIO_NUM_16) {
-                gpio_set_level(GPIO_NUM_4, 0);
-            }
-            ESP_LOGI(TAG, "  %s — OFF", relay_seq[i].name);
-
-            vTaskDelay(pdMS_TO_TICKS(RELAY_GAP_MS));
-            pass++;
-        }
-    }
-
-    /* ---- 6. LDR Light Sensor ---- */
-    ESP_LOGI(TAG, "[6/6] LDR Light Sensor (5 readings)");
-    {
-        for (int i = 0; i < DIAG_READINGS; i++) {
-            float v = ldr_read_voltage();
-            if (v < 0.0f) {
-                ESP_LOGE(TAG, "  [%d/%d] READ ERROR", i + 1, DIAG_READINGS);
-                fail++;
-            } else {
-                float pct = (v / 3.3f) * 100.0f;
-                ESP_LOGI(TAG, "  [%d/%d] %.4f V (~%.0f %%) — OK",
-                         i + 1, DIAG_READINGS, (double)v, (double)pct);
-                pass++;
-            }
-            vTaskDelay(pdMS_TO_TICKS(DIAG_DELAY_MS));
-        }
-    }
-
-    /* ---- Summary ---- */
-    ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "  Diagnostics Complete");
-    ESP_LOGI(TAG, "  PASS: %d  WARN: %d  FAIL: %d", pass, warn, fail);
-    ESP_LOGI(TAG, "========================================");
-
-    /* Final LCD message */
-    lcd_clear();
-    lcd_write_at(0, 3, "Diagnostics OK");
-    if (fail > 0) {
-        char buf[21];
-        snprintf(buf, sizeof(buf), "WARN:%d FAIL:%d", warn, fail);
-        lcd_write_at(1, 2, buf);
-    }
-    lcd_write_at(3, 0, "Booting system...");
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    lcd_clear();
-}
-
-#endif /* RUN_DIAGNOSTIC_TESTS */
-
-/* ========================================================================= */
-/*  SECTION 3 — Firebase Config Callback                                     */
+/*  Firebase Config Callback                                                  */
 /* ========================================================================= */
 
 static void on_firebase_config(const char *json_str)
@@ -578,36 +290,65 @@ static void on_firebase_config(const char *json_str)
     cJSON *root = cJSON_Parse(json_str);
     if (!root) return;
 
+    /* Firebase SSE wraps config in {"path":"/...","data":...}. */
+    const cJSON *path = cJSON_GetObjectItem(root, "path");
+    const cJSON *data = cJSON_GetObjectItem(root, "data");
+    if (!cJSON_IsString(path) || !data || cJSON_IsNull(data)) {
+        cJSON_Delete(root);
+        return;
+    }
+
+    const char *key = path->valuestring;
+    if (*key == '/') ++key;
+    const bool whole_config = *key == '\0';
+
+    bool switch_off = false;
+    bool changed = false;
+    struct SystemConfig updated = {0};
     if (xSemaphoreTake(s_config_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-        cJSON *item;
+        const struct SystemConfig previous = g_config;
+        const cJSON *item;
+#define CONFIG_ITEM(name) (whole_config ? cJSON_GetObjectItem(data, name) : (strcmp(key, name) == 0 ? data : NULL))
+        item = CONFIG_ITEM("setpoint_ph");
+        if (cJSON_IsNumber(item) && isfinite(item->valuedouble) && item->valuedouble >= 4 && item->valuedouble <= 8) g_config.setpoint_ph = (float)item->valuedouble;
+        item = CONFIG_ITEM("setpoint_ec_ms_cm");
+        if (cJSON_IsNumber(item) && isfinite(item->valuedouble) && item->valuedouble >= 0.5 && item->valuedouble <= 3.5) g_config.setpoint_ec_ms_cm = (float)item->valuedouble;
+        item = CONFIG_ITEM("setpoint_temperature_c");
+        if (cJSON_IsNumber(item) && isfinite(item->valuedouble) && item->valuedouble >= 18 && item->valuedouble <= 30) g_config.setpoint_temperature_c = (float)item->valuedouble;
+        item = CONFIG_ITEM("schedule_off_hour");
+        if (cJSON_IsNumber(item) && item->valuedouble == item->valueint && item->valueint >= 0 && item->valueint <= 23) g_config.schedule_off_hour = item->valueint;
+        item = CONFIG_ITEM("schedule_on_hour");
+        if (cJSON_IsNumber(item) && item->valuedouble == item->valueint && item->valueint >= 0 && item->valueint <= 23) g_config.schedule_on_hour = item->valueint;
+        item = CONFIG_ITEM("automation_enabled");
+        if (cJSON_IsBool(item)) g_config.automation_enabled = cJSON_IsTrue(item);
+#undef CONFIG_ITEM
 
-        item = cJSON_GetObjectItem(root, "sp_pH");
-        if (item && cJSON_IsNumber(item)) g_config.sp_pH = (float)item->valuedouble;
-
-        item = cJSON_GetObjectItem(root, "sp_ec");
-        if (item && cJSON_IsNumber(item)) g_config.sp_ec = (float)item->valuedouble;
-
-        item = cJSON_GetObjectItem(root, "sp_temp");
-        if (item && cJSON_IsNumber(item)) g_config.sp_temp = (float)item->valuedouble;
-
-        item = cJSON_GetObjectItem(root, "auto_enabled");
-        if (item && cJSON_IsBool(item)) g_config.auto_enabled = cJSON_IsTrue(item);
-
-        item = cJSON_GetObjectItem(root, "auto_off_hour");
-        if (item && cJSON_IsNumber(item)) g_config.auto_off_hour = item->valueint;
-
-        item = cJSON_GetObjectItem(root, "auto_on_hour");
-        if (item && cJSON_IsNumber(item)) g_config.auto_on_hour = item->valueint;
+        switch_off = previous.automation_enabled && !g_config.automation_enabled;
+        changed = previous.setpoint_ph != g_config.setpoint_ph ||
+                  previous.setpoint_ec_ms_cm != g_config.setpoint_ec_ms_cm ||
+                  previous.setpoint_temperature_c != g_config.setpoint_temperature_c ||
+                  previous.automation_enabled != g_config.automation_enabled ||
+                  previous.schedule_on_hour != g_config.schedule_on_hour ||
+                  previous.schedule_off_hour != g_config.schedule_off_hour;
+        updated = g_config;
 
         xSemaphoreGive(s_config_mutex);
-        ESP_LOGI(TAG, "Config updated from Firebase SSE");
+        ESP_LOGI(TAG, "Config received from Firebase SSE%s", changed ? " (updated)" : " (unchanged)");
     }
+
+    if (switch_off) {
+        actuators_emergency_stop();
+        xQueueReset(s_q_act);
+        ESP_LOGW(TAG, "Automation disabled from Web App: all relays OFF");
+    }
+
+    if (changed) save_control_config(&updated);
 
     cJSON_Delete(root);
 }
 
 /* ========================================================================= */
-/*  SECTION 4 — FreeRTOS Task Functions                                      */
+/*  FreeRTOS Task Functions                                                   */
 /* ========================================================================= */
 
 /* ---- Core 1: taskSensor (Priority 4, 5 s interval) ---- */
@@ -615,37 +356,54 @@ static void on_firebase_config(const char *json_str)
 static void task_sensor(void *pv)
 {
     TickType_t last_wake = xTaskGetTickCount();
+    bool outputs_allowed_last_cycle = false;
 
     while (1) {
+        struct SystemConfig config = {0};
+        const bool outputs_allowed = automation_allowed(&config);
+        if (!outputs_allowed && outputs_allowed_last_cycle) {
+            actuators_emergency_stop();
+        }
+        outputs_allowed_last_cycle = outputs_allowed;
         float temp = temp_sensor_sample();
-        if (temp <= TEMP_SENSOR_NO_DEVICE) {
+        if (!isfinite(temp) || temp <= TEMP_SENSOR_NO_DEVICE) {
             ESP_LOGW(TAG, "Temperature sensor error — skipping cycle");
+            if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                g_sensor.valid = false;
+                xSemaphoreGive(s_sensor_mutex);
+            }
+            actuators_emergency_stop();
+            xQueueReset(s_q_act);
             vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(5000));
             continue;
         }
 
-        float ph    = ph_sensor_read_compensated(temp);
+        float ph = 0;
+        const bool ph_ok = ph_read_calibrated(&ph);
         float tds   = tds_sensor_read_tds(temp);
-        float ec    = tds_sensor_read_ec(temp);
-        float light = ldr_read_voltage();
+        float ec    = tds_sensor_ec_from_tds(tds);
+        bool light_high = ldr_read_high();
         bool  low   = !actuators_water_ok();
+        const bool valid = ph_ok && isfinite(tds) && tds >= 0.0f &&
+                           isfinite(ec) && ec >= 0.0f;
 
         if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            g_sensor.pH          = ph;
-            g_sensor.tds         = tds;
-            g_sensor.ec          = ec;
-            g_sensor.temperature = temp;
-            g_sensor.light       = (light >= 0.0f) ? light : 0.0f;
-            g_sensor.waterLow    = low;
+            g_sensor.ph             = ph_ok ? ph : 0.0f;
+            g_sensor.tds_ppm        = valid ? tds : 0.0f;
+            g_sensor.ec_ms_cm       = valid ? ec : 0.0f;
+            g_sensor.temperature_c  = temp;
+            g_sensor.light_do_high  = light_high;
+            g_sensor.water_low      = low;
+            g_sensor.valid          = valid;
             xSemaphoreGive(s_sensor_mutex);
         }
 
-        /* Peltier cooling — independent hysteresis (not fuzzy) */
-        actuators_control_cooling(temp);
+        /* Cooling follows the same web automation switch and WIB schedule. */
+        if (outputs_allowed) actuators_control_cooling(temp, config.setpoint_temperature_c);
 
-        ESP_LOGI(TAG, "Sensors — pH:%.3f TDS:%.1f EC:%.3f T:%.1f°C Light:%.2fV Water:%s",
+        ESP_LOGI(TAG, "Sensors — pH:%.3f TDS:%.1f EC:%.3f T:%.1f°C LDR:%s Water:%s valid:%d",
                  (double)ph, (double)tds, (double)ec, (double)temp,
-                 (double)light, low ? "LOW" : "OK");
+                 light_high ? "BRIGHT" : "DARK", low ? "LOW" : "OK", valid);
 
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(5000));
     }
@@ -658,17 +416,45 @@ static void task_control(void *pv)
     TickType_t last_wake = xTaskGetTickCount();
 
     while (1) {
-        float ph = 0, tds = 0;
+        float ph = 0, tds = 0, ec = 0;
+        bool valid = false;
         if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            ph  = g_sensor.pH;
-            tds = g_sensor.tds;
+            ph  = g_sensor.ph;
+            tds = g_sensor.tds_ppm;
+            ec = g_sensor.ec_ms_cm;
+            valid = g_sensor.valid;
             xSemaphoreGive(s_sensor_mutex);
+        }
+
+        if (!valid) {
+            ESP_LOGW(TAG, "Fuzzy skipped: no valid sensor sample");
+            vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(5000));
+            continue;
         }
 
         float ph_up_ms = 0, ph_dn_ms = 0, nut_ms = 0;
         fuzzy_evaluate(ph, tds, &ph_up_ms, &ph_dn_ms, &nut_ms);
 
-        ESP_LOGI(TAG, "Fuzzy — pH_Up:%.0f ms  pH_Dn:%.0f ms  Nut:%.0f ms",
+        ESP_LOGI(TAG, "Fuzzy preview input pH=%.3f TDS=%.1f; output pH_Up=%.0f ms pH_Dn=%.0f ms Nut=%.0f ms",
+                 (double)ph, (double)tds,
+                 (double)ph_up_ms, (double)ph_dn_ms, (double)nut_ms);
+
+        struct SystemConfig config = {0};
+        if (!automation_allowed(&config)) {
+            const char *reason = !config.automation_enabled ? "automation switch OFF" :
+                                 "outside WIB schedule";
+            ESP_LOGI(TAG, "Relay command blocked: %s", reason);
+            vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(5000));
+            continue;
+        }
+
+        /* The MATLAB-comparable fuzzy outputs above remain unchanged.
+         * Web setpoints gate relay commands to avoid dosing past the target. */
+        if (ph >= config.setpoint_ph - 0.05f) ph_up_ms = 0;
+        if (ph <= config.setpoint_ph + 0.05f) ph_dn_ms = 0;
+        if (ec >= config.setpoint_ec_ms_cm - 0.05f) nut_ms = 0;
+        ESP_LOGI(TAG, "Setpoint gate pH=%.2f EC=%.2f: pH_Up=%.0f pH_Dn=%.0f Nut=%.0f ms",
+                 (double)config.setpoint_ph, (double)config.setpoint_ec_ms_cm,
                  (double)ph_up_ms, (double)ph_dn_ms, (double)nut_ms);
 
         struct ActCmd cmd = {
@@ -677,6 +463,11 @@ static void task_control(void *pv)
             .ph_ms    = (ph_up_ms > ph_dn_ms) ? (uint32_t)ph_up_ms : (uint32_t)ph_dn_ms,
             .ph_is_up = (ph_up_ms > ph_dn_ms),
         };
+
+        if (cmd.nut_a_ms == 0 && cmd.nut_b_ms == 0 && cmd.ph_ms == 0) {
+            vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(5000));
+            continue;
+        }
 
         if (xQueueSend(s_q_act, &cmd, pdMS_TO_TICKS(100)) != pdTRUE) {
             ESP_LOGW(TAG, "Actuator queue full — command dropped");
@@ -695,14 +486,8 @@ static void task_actuator(void *pv)
     while (1) {
         if (xQueueReceive(s_q_act, &cmd, portMAX_DELAY) == pdTRUE) {
 
-            bool auto_en = false;
-            if (xSemaphoreTake(s_config_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                auto_en = g_config.auto_enabled;
-                xSemaphoreGive(s_config_mutex);
-            }
-
-            if (!auto_en) {
-                ESP_LOGI(TAG, "Auto mode OFF — skipping actuation");
+            if (!automation_allowed(NULL)) {
+                ESP_LOGI(TAG, "Automation OFF or outside schedule — skipping actuation");
                 continue;
             }
 
@@ -724,28 +509,53 @@ static void task_upload(void *pv)
     TickType_t last_wake = xTaskGetTickCount();
 
     while (1) {
-        float ph = 0, ec = 0, tds = 0, temp = 0, light = 0;
-        bool  low = false;
+        float ph = 0, ec = 0, tds = 0, temp = 0;
+        bool  low = false, light_high = false, valid = false;
 
         if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            ph    = g_sensor.pH;
-            ec    = g_sensor.ec;
-            tds   = g_sensor.tds;
-            temp  = g_sensor.temperature;
-            light = g_sensor.light;
-            low   = g_sensor.waterLow;
+            ph    = g_sensor.ph;
+            ec    = g_sensor.ec_ms_cm;
+            tds   = g_sensor.tds_ppm;
+            temp  = g_sensor.temperature_c;
+            light_high = g_sensor.light_do_high;
+            low   = g_sensor.water_low;
+            valid = g_sensor.valid;
             xSemaphoreGive(s_sensor_mutex);
         }
+
+        if (!valid) {
+            ESP_LOGW(TAG, "Upload skipped: no valid sensor sample");
+            vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(60000));
+            continue;
+        }
+
+        actuators_status_t pump_status = {0};
+        actuators_get_status(&pump_status);
 
         /* Build live telemetry JSON */
         cJSON *live = cJSON_CreateObject();
         if (live) {
-            cJSON_AddNumberToObject(live, "pH",          (double)ph);
-            cJSON_AddNumberToObject(live, "ec",          (double)ec);
-            cJSON_AddNumberToObject(live, "tds",         (double)tds);
-            cJSON_AddNumberToObject(live, "temperature", (double)temp);
-            cJSON_AddNumberToObject(live, "light",       (double)light);
-            cJSON_AddBoolToObject  (live, "waterLow",    low);
+            cJSON_AddNumberToObject(live, "ph",             (double)ph);
+            cJSON_AddNumberToObject(live, "ec_ms_cm",       (double)ec);
+            cJSON_AddNumberToObject(live, "tds_ppm",        (double)tds);
+            cJSON_AddNumberToObject(live, "temperature_c",  (double)temp);
+            cJSON_AddBoolToObject  (live, "light_do_high",  light_high);
+            cJSON_AddBoolToObject  (live, "float_switch_high", low);
+            cJSON_AddBoolToObject  (live, "water_low",      low);
+            cJSON_AddStringToObject(live, "measurement_mode", "normal");
+            cJSON_AddBoolToObject(live, "automation_active", automation_allowed(NULL));
+
+            cJSON *pumps = cJSON_CreateObject();
+            if (pumps) {
+                cJSON_AddBoolToObject(pumps, "ph_up",            pump_status.ph_up);
+                cJSON_AddBoolToObject(pumps, "ph_down",          pump_status.ph_down);
+                cJSON_AddBoolToObject(pumps, "nutrient_a",       pump_status.nutrient_a);
+                cJSON_AddBoolToObject(pumps, "nutrient_b",       pump_status.nutrient_b);
+                cJSON_AddBoolToObject(pumps, "peltier",          pump_status.peltier);
+                cJSON_AddBoolToObject(pumps, "circulation_pump", pump_status.circulation_pump);
+                cJSON_AddItemToObject(live, "pump_status", pumps);
+            }
+            add_server_timestamp(live, "timestamp_ms");
 
             char *live_str = cJSON_PrintUnformatted(live);
             if (live_str) {
@@ -756,24 +566,28 @@ static void task_upload(void *pv)
         }
 
         /* Build log entry JSON */
-        cJSON *log = cJSON_CreateObject();
-        if (log) {
-            cJSON_AddNumberToObject(log, "pH",          (double)ph);
-            cJSON_AddNumberToObject(log, "ec",          (double)ec);
-            cJSON_AddNumberToObject(log, "tds",         (double)tds);
-            cJSON_AddNumberToObject(log, "temperature", (double)temp);
-            cJSON_AddNumberToObject(log, "light",       (double)light);
-            cJSON_AddBoolToObject  (log, "waterLow",    low);
+        cJSON *history_record = cJSON_CreateObject();
+        if (history_record) {
+            cJSON_AddNumberToObject(history_record, "ph",             (double)ph);
+            cJSON_AddNumberToObject(history_record, "ec_ms_cm",       (double)ec);
+            cJSON_AddNumberToObject(history_record, "tds_ppm",        (double)tds);
+            cJSON_AddNumberToObject(history_record, "temperature_c",  (double)temp);
+            cJSON_AddBoolToObject  (history_record, "light_do_high",  light_high);
+            cJSON_AddBoolToObject  (history_record, "float_switch_high", low);
+            cJSON_AddBoolToObject  (history_record, "water_low",      low);
+            add_server_timestamp(history_record, "timestamp_ms");
 
-            char *log_str = cJSON_PrintUnformatted(log);
-            if (log_str) {
-                firebase_post_log(log_str);
-                cJSON_free(log_str);
+            char *history_str = cJSON_PrintUnformatted(history_record);
+            if (history_str) {
+                firebase_post_history(history_str);
+                cJSON_free(history_str);
             }
-            cJSON_Delete(log);
+            cJSON_Delete(history_record);
         }
 
         ESP_LOGI(TAG, "Upload complete");
+
+        firebase_put_heartbeat();
 
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(60000));
     }
@@ -804,11 +618,11 @@ static void task_display(void *pv)
         bool  low = false;
 
         if (xSemaphoreTake(s_sensor_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-            ph   = g_sensor.pH;
-            ec   = g_sensor.ec;
-            tds  = g_sensor.tds;
-            temp = g_sensor.temperature;
-            low  = g_sensor.waterLow;
+            ph   = g_sensor.ph;
+            ec   = g_sensor.ec_ms_cm;
+            tds  = g_sensor.tds_ppm;
+            temp = g_sensor.temperature_c;
+            low  = g_sensor.water_low;
             xSemaphoreGive(s_sensor_mutex);
         }
 
@@ -838,12 +652,68 @@ static void task_display(void *pv)
 }
 
 /* ========================================================================= */
-/*  SECTION 5 — app_main                                                     */
+/*  app_main                                                                  */
 /* ========================================================================= */
+
+/* Firebase Auth performs TLS handshakes, which exceeded the 3584-byte
+ * ESP-IDF main-task stack in the hardware log. Keep network setup on a
+ * dedicated task and let app_main return after starting the system. */
+static void task_comms_start(void *pv)
+{
+    if (firebase_client_init() == ESP_OK) {
+        const esp_sntp_config_t time_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+        if (esp_netif_sntp_init(&time_config) == ESP_OK) {
+            const esp_err_t sync_result = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(10000));
+            ESP_LOGI(TAG, "WIB schedule clock sync: %s", esp_err_to_name(sync_result));
+        } else {
+            ESP_LOGW(TAG, "NTP init failed; last automation switch remains active, schedule unavailable");
+        }
+        if (!firebase_start_config_stream(on_firebase_config)) {
+            ESP_LOGE(TAG, "Config stream did not start; local saved config remains active");
+        }
+        if (xTaskCreatePinnedToCore(task_upload, "upload", 12288, NULL, 1, NULL, 0) != pdPASS) {
+            ESP_LOGE(TAG, "FATAL: Failed to create task_upload");
+            configASSERT(0);
+        }
+        ESP_LOGI(TAG, "Firebase client ready — telemetry & config stream active");
+    } else {
+        ESP_LOGE(TAG, "Firebase init failed — running offline (no uploads, no config sync)");
+    }
+    vTaskDelete(NULL);
+}
 
 void app_main(void)
 {
     ESP_LOGI(TAG, "=== AQUAHARU Firmware Starting ===");
+
+#ifdef RUN_BENCH_RELAY
+    bench_relay_start();
+    return; /* No normal control, sensor, Firebase or actuator tasks. */
+#endif
+#ifdef RUN_BENCH_ALL_SENSORS
+    bench_all_sensors_start();
+    return; /* Never start normal control, actuator, SSE or float tasks. */
+#endif
+#ifdef RUN_BENCH_FIREBASE_SIM
+    bench_firebase_sim_start();
+    return; /* Never fall through to sensors, actuators, SSE or normal tasks. */
+#endif
+#ifdef RUN_BENCH_TEMP_SENSOR
+    bench_temp_sensor_start();
+    return; /* Never fall through to control, actuators, Firebase or other sensors. */
+#endif
+#ifdef RUN_BENCH_TDS_SENSOR
+    bench_tds_sensor_start();
+    return; /* Never fall through to control, actuators, Firebase or other sensors. */
+#endif
+#ifdef RUN_BENCH_PH_SENSOR
+    bench_ph_sensor_start();
+    return; /* Never fall through to control, actuators, Firebase or other sensors. */
+#endif
+
+#ifdef RUN_BENCH_LCD_WIFI
+    bench_test_lcd_wifi();   /* never returns */
+#endif
 
     /* ---- Synchronisation primitives ---- */
     s_sensor_mutex = xSemaphoreCreateMutex();
@@ -870,36 +740,22 @@ void app_main(void)
     }
 
     /* Actuators */
-    if (actuators_init() != 0) {
-        ESP_LOGE(TAG, "Actuators init failed");
+    const gpio_config_t ldr_input = {
+        .pin_bit_mask = 1ULL << GPIO_NUM_34,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&ldr_input));
+
+    if (actuators_init() != ESP_OK) {
+        ESP_LOGE(TAG, "FATAL: Actuators init failed");
+        configASSERT(0);
     }
 
-    /* =====================================================================
-     * DEVELOPMENT MODE — Isolated Component Testing
-     *
-     * To test a single component on the bench, comment out the task
-     * creation blocks AND the diagnostic block below, then uncomment
-     * ONE of these calls:
-     *
-     *   test_sensor_temp();
-     *   test_sensor_ph();
-     *   test_sensor_tds();
-     *   test_sensor_light();
-     *   test_float_switch();
-     *   test_relay_pump_ph_up();
-     *   test_relay_pump_ph_down();
-     *   test_relay_pump_nut_a();
-     *   test_relay_pump_nut_b();
-     *   test_relay_peltier();
-     *   test_relay_circulation();
-     *
-     * Each function runs an infinite loop with a 1 s internal delay.
-     * ===================================================================== */
-
-#ifdef RUN_DIAGNOSTIC_TESTS
-    /* ---- Full-system diagnostic (blocking) ---- */
-    run_full_diagnostics();
-#endif
+    /* Relays are OFF before restoring a saved automation switch. */
+    load_control_config();
 
     /* ---- Core 1 — Control Tasks ---- */
     if (xTaskCreatePinnedToCore(task_sensor,   "sensor",   4096, NULL, 4, NULL, 1) != pdPASS) {
@@ -925,26 +781,9 @@ void app_main(void)
         configASSERT(0);
     }
 
-    /* Firebase client (Wi-Fi + Auth — blocking call, runs on Core 0 via caller) */
-    if (firebase_client_init() == 0) {
-        /* Start listening for remote config changes via SSE */
-        firebase_start_config_stream(on_firebase_config);
-
-        /* Start periodic upload task */
-        if (xTaskCreatePinnedToCore(task_upload, "upload", 4096, NULL, 1, NULL, 0) != pdPASS) {
-            ESP_LOGE(TAG, "FATAL: Failed to create task_upload");
-            configASSERT(0);
-        }
-        ESP_LOGI(TAG, "Firebase client ready — telemetry & config stream active");
-    } else {
-        ESP_LOGE(TAG, "Firebase init failed — running offline (no uploads, no config sync)");
+    if (xTaskCreatePinnedToCore(task_comms_start, "comms_start", 16384, NULL, 2, NULL, 0) != pdPASS) {
+        ESP_LOGE(TAG, "FATAL: Failed to create task_comms_start");
+        configASSERT(0);
     }
-
-    ESP_LOGI(TAG, "Core 0 (comms) tasks started — display, upload");
-    ESP_LOGI(TAG, "=== System ready ===");
-
-    /* Prevent app_main() from returning (FreeRTOS scheduler is already running) */
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
+    ESP_LOGI(TAG, "=== System tasks started ===");
 }

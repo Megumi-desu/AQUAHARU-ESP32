@@ -24,9 +24,9 @@ extern "C" {
 /* Configuration                                                              */
 /* -------------------------------------------------------------------------- */
 
-/** PCF8574 I2C address (0x3C or 0x27 are common). */
+/** PCF8574 I2C address (0x27 confirmed by bench scan; 0x3F/0x3C on some backpacks). */
 #ifndef LCD_I2C_ADDR
-#define LCD_I2C_ADDR  0x3C
+#define LCD_I2C_ADDR  0x27
 #endif
 
 /** Number of character columns. */

@@ -158,21 +158,22 @@ static bool s_lut_ready = false;
  */
 static float fuzzify_trap(float x, float a, float b, float c, float d)
 {
-    if (x <= a || x >= d) {
-        return 0.0f;
-    }
-
     /* Left shoulder (a == b): no rising edge, flat top starts at a */
     if (a == b) {
+        if (x < a) return 0.0f;
         if (x <= c) return 1.0f;
+        if (x >= d) return 0.0f;
         return (d - x) / (d - c);          /* ramp down */
     }
 
     /* Right shoulder (c == d): no falling edge */
     if (c == d) {
+        if (x <= a) return 0.0f;
         if (x >= b) return 1.0f;
         return (x - a) / (b - a);          /* ramp up */
     }
+
+    if (x <= a || x >= d) return 0.0f;
 
     /* Standard trapezoid with both rising and falling edges */
     if (x < b) {

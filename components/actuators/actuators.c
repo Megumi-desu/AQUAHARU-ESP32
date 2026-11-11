@@ -6,13 +6,14 @@
  * Manages 6 relays via GPIO, enforces staggered pump sequencing with
  * non-blocking RTOS delays, Peltier cooling hysteresis with a 60 s flush
  * timer, 5-minute mixing lockout, hard-limit over-dosing protection, and
- * float-switch dry-run protection.
+ * float-switch status reporting. The float input does not gate relays.
  */
 
 #include "actuators.h"
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <math.h>
 
 #include "driver/gpio.h"
 #include "esp_err.h"
@@ -27,7 +28,7 @@
 
 static const char *TAG = "actuators";
 
-/* Relay GPIOs (active-high) */
+/* Relay GPIOs (active-LOW on the tested 8-channel board) */
 #define GPIO_PH_UP          GPIO_NUM_19
 #define GPIO_PH_DOWN        GPIO_NUM_18
 #define GPIO_NUT_A          GPIO_NUM_5
@@ -42,8 +43,7 @@ static const char *TAG = "actuators";
 #define STAGGER_DELAY_MS    10000   /* 10 s between nutrient A → B → pH */
 
 /* Cooling hysteresis thresholds */
-#define COOLING_ON_TEMP     26.0f
-#define COOLING_OFF_TEMP    24.0f
+#define COOLING_HYSTERESIS_C 2.0f
 
 /* Circulation pump flush time after Peltier off */
 #define FLUSH_DURATION_US   (60ULL * 1000 * 1000)   /* 60 s in µs */
@@ -67,6 +67,7 @@ typedef enum {
 static cooling_state_t   s_cooling_state = COOL_IDLE;
 static esp_timer_handle_t s_flush_timer   = NULL;
 static volatile bool      s_pumping       = false;   /* true during execute_cycle */
+static volatile uint32_t  s_stop_epoch    = 0;
 
 /* -------------------------------------------------------------------------- */
 /* Forward Declarations                                                       */
@@ -79,16 +80,16 @@ static bool read_float_switch(void);
 /* Internal Helpers                                                           */
 /* -------------------------------------------------------------------------- */
 
-/** Turn a single relay ON (active-high). */
+/** Turn a single relay ON (active-LOW). */
 static inline void relay_on(gpio_num_t gpio)
 {
-    gpio_set_level(gpio, 1);
+    gpio_set_level(gpio, 0);
 }
 
 /** Turn a single relay OFF. */
 static inline void relay_off(gpio_num_t gpio)
 {
-    gpio_set_level(gpio, 0);
+    gpio_set_level(gpio, 1);
 }
 
 /** Turn ALL relay outputs OFF. */
@@ -102,10 +103,29 @@ static void all_relays_off(void)
     relay_off(GPIO_CIRC_PUMP);
 }
 
-/** Read float switch: true = water OK (GPIO high), false = low (GPIO low). */
+/** Tested float polarity: LOW = water OK, HIGH = water low. */
 static bool read_float_switch(void)
 {
-    return (gpio_get_level(GPIO_FLOAT_SW) == 1);
+    return (gpio_get_level(GPIO_FLOAT_SW) == 0);
+}
+
+/* Keep a running relay cancellable when automation is switched off. */
+static bool run_relay_checked(gpio_num_t gpio, uint32_t duration_ms, uint32_t expected_epoch)
+{
+    if (duration_ms == 0) return true;
+    if (s_stop_epoch != expected_epoch) return false;
+    relay_on(gpio);
+    while (duration_ms > 0) {
+        const uint32_t step_ms = duration_ms > 100 ? 100 : duration_ms;
+        vTaskDelay(pdMS_TO_TICKS(step_ms));
+        duration_ms -= step_ms;
+        if (s_stop_epoch != expected_epoch) {
+            relay_off(gpio);
+            return false;
+        }
+    }
+    relay_off(gpio);
+    return true;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -146,12 +166,23 @@ int actuators_init(void)
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type    = GPIO_INTR_DISABLE,
     };
-    gpio_config(&out_conf);
+    /* Preload OFF before the pins become outputs; also hold GPIO2 relay input OFF. */
+    gpio_set_level(GPIO_NUM_2, 1);
+    gpio_set_level(GPIO_PH_UP, 1);
+    gpio_set_level(GPIO_PH_DOWN, 1);
+    gpio_set_level(GPIO_NUT_A, 1);
+    gpio_set_level(GPIO_NUT_B, 1);
+    gpio_set_level(GPIO_PELTIER, 1);
+    gpio_set_level(GPIO_CIRC_PUMP, 1);
+    out_conf.pin_bit_mask |= 1ULL << GPIO_NUM_2;
+    out_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+    esp_err_t gpio_ret = gpio_config(&out_conf);
+    if (gpio_ret != ESP_OK) return gpio_ret;
 
     /* Ensure all relays start OFF */
     all_relays_off();
 
-    /* ---- Float switch input (external pull-up) ---- */
+    /* ---- Float switch input (GPIO35 needs an external defined bias) ---- */
     gpio_config_t in_conf = {
         .pin_bit_mask = (1ULL << GPIO_FLOAT_SW),
         .mode         = GPIO_MODE_INPUT,
@@ -159,7 +190,8 @@ int actuators_init(void)
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type    = GPIO_INTR_DISABLE,
     };
-    gpio_config(&in_conf);
+    gpio_ret = gpio_config(&in_conf);
+    if (gpio_ret != ESP_OK) return gpio_ret;
 
     /* ---- Flush timer (one-shot, not yet started) ---- */
     const esp_timer_create_args_t timer_args = {
@@ -177,6 +209,7 @@ int actuators_init(void)
     s_initialized     = true;
 
     ESP_LOGI(TAG, "Actuators initialised — all relays OFF");
+    ESP_LOGW(TAG, "Float switch is status-only; relay control does not use water level");
     return 0;
 }
 
@@ -199,6 +232,20 @@ bool actuators_is_pumping(void)
     return s_pumping;
 }
 
+void actuators_get_status(actuators_status_t *status)
+{
+    if (!status || !s_initialized) {
+        return;
+    }
+
+    status->ph_up            = gpio_get_level(GPIO_PH_UP) == 0;
+    status->ph_down          = gpio_get_level(GPIO_PH_DOWN) == 0;
+    status->nutrient_a       = gpio_get_level(GPIO_NUT_A) == 0;
+    status->nutrient_b       = gpio_get_level(GPIO_NUT_B) == 0;
+    status->peltier          = gpio_get_level(GPIO_PELTIER) == 0;
+    status->circulation_pump = gpio_get_level(GPIO_CIRC_PUMP) == 0;
+}
+
 /* -------------------------------------------------------------------------- */
 
 bool actuators_can_dose(void)
@@ -213,12 +260,6 @@ bool actuators_can_dose(void)
         return false;
     }
 
-    /* Check water level */
-    if (!read_float_switch()) {
-        ESP_LOGE(TAG, "Water level LOW — dosing blocked");
-        return false;
-    }
-
     return true;
 }
 
@@ -226,6 +267,7 @@ bool actuators_can_dose(void)
 
 void actuators_emergency_stop(void)
 {
+    ++s_stop_epoch;
     all_relays_off();
 
     /* Cancel any pending flush */
@@ -269,7 +311,10 @@ bool actuators_execute_cycle(uint32_t nut_a_ms, uint32_t nut_b_ms,
         ph_ms = ACTUATORS_PH_MAX_MS;
     }
 
+    if (nut_a_ms == 0 && nut_b_ms == 0 && ph_ms == 0) return false;
+
     gpio_num_t ph_gpio = ph_is_up ? GPIO_PH_UP : GPIO_PH_DOWN;
+    const uint32_t epoch = s_stop_epoch;
 
     s_pumping = true;
 
@@ -278,41 +323,37 @@ bool actuators_execute_cycle(uint32_t nut_a_ms, uint32_t nut_b_ms,
              ph_is_up ? "Up" : "Down", (unsigned long)ph_ms);
 
     /* ---- Stage 1: Nutrient A ---- */
-    if (!read_float_switch()) goto water_low;
+    if (s_stop_epoch != epoch) goto cancelled;
 
     if (nut_a_ms > 0) {
         ESP_LOGI(TAG, "Nutrient A ON (%lu ms)", (unsigned long)nut_a_ms);
-        relay_on(GPIO_NUT_A);
-        vTaskDelay(pdMS_TO_TICKS(nut_a_ms));
-        relay_off(GPIO_NUT_A);
+        if (!run_relay_checked(GPIO_NUT_A, nut_a_ms, epoch)) goto cancelled;
         ESP_LOGI(TAG, "Nutrient A OFF");
     }
 
     /* ---- Stagger delay ---- */
-    vTaskDelay(pdMS_TO_TICKS(STAGGER_DELAY_MS));
+    if (nut_a_ms > 0 && (nut_b_ms > 0 || ph_ms > 0))
+        vTaskDelay(pdMS_TO_TICKS(STAGGER_DELAY_MS));
 
     /* ---- Stage 2: Nutrient B ---- */
-    if (!read_float_switch()) goto water_low;
+    if (s_stop_epoch != epoch) goto cancelled;
 
     if (nut_b_ms > 0) {
         ESP_LOGI(TAG, "Nutrient B ON (%lu ms)", (unsigned long)nut_b_ms);
-        relay_on(GPIO_NUT_B);
-        vTaskDelay(pdMS_TO_TICKS(nut_b_ms));
-        relay_off(GPIO_NUT_B);
+        if (!run_relay_checked(GPIO_NUT_B, nut_b_ms, epoch)) goto cancelled;
         ESP_LOGI(TAG, "Nutrient B OFF");
     }
 
     /* ---- Stagger delay ---- */
-    vTaskDelay(pdMS_TO_TICKS(STAGGER_DELAY_MS));
+    if (nut_b_ms > 0 && ph_ms > 0)
+        vTaskDelay(pdMS_TO_TICKS(STAGGER_DELAY_MS));
 
     /* ---- Stage 3: pH pump ---- */
-    if (!read_float_switch()) goto water_low;
+    if (s_stop_epoch != epoch) goto cancelled;
 
     if (ph_ms > 0) {
         ESP_LOGI(TAG, "pH %s ON (%lu ms)", ph_is_up ? "Up" : "Down", (unsigned long)ph_ms);
-        relay_on(ph_gpio);
-        vTaskDelay(pdMS_TO_TICKS(ph_ms));
-        relay_off(ph_gpio);
+        if (!run_relay_checked(ph_gpio, ph_ms, epoch)) goto cancelled;
         ESP_LOGI(TAG, "pH %s OFF", ph_is_up ? "Up" : "Down");
     }
 
@@ -323,36 +364,29 @@ bool actuators_execute_cycle(uint32_t nut_a_ms, uint32_t nut_b_ms,
              (int)(ACTUATORS_MIXING_LOCKOUT_MS / 60000));
     return true;
 
-water_low:
-    ESP_LOGE(TAG, "Float switch tripped during cycle — aborting");
+cancelled:
+    ESP_LOGW(TAG, "Dosing cycle cancelled by automation stop");
     s_pumping = false;
-    actuators_emergency_stop();
+    all_relays_off();
     return false;
 }
 
 /* -------------------------------------------------------------------------- */
 
-void actuators_control_cooling(float temperature_c)
+void actuators_control_cooling(float temperature_c, float setpoint_c)
 {
-    if (!s_initialized) {
+    if (!s_initialized || !isfinite(temperature_c) || !isfinite(setpoint_c)) {
         return;
     }
-
-    /* Dry-run protection overrides cooling */
-    if (!read_float_switch()) {
-        if (s_cooling_state != COOL_IDLE) {
-            ESP_LOGW(TAG, "Water low — forcing cooling OFF");
-            actuators_emergency_stop();
-        }
-        return;
-    }
+    const float on_temp = setpoint_c + COOLING_HYSTERESIS_C;
+    const float off_temp = setpoint_c;
 
     switch (s_cooling_state) {
 
     case COOL_IDLE:
-        if (temperature_c > COOLING_ON_TEMP) {
+        if (temperature_c > on_temp) {
             ESP_LOGI(TAG, "T=%.1f °C > %.1f — Peltier + Circulation Pump ON",
-                     (double)temperature_c, (double)COOLING_ON_TEMP);
+                     (double)temperature_c, (double)on_temp);
             relay_on(GPIO_PELTIER);
             relay_on(GPIO_CIRC_PUMP);
             s_cooling_state = COOL_ACTIVE;
@@ -360,9 +394,9 @@ void actuators_control_cooling(float temperature_c)
         break;
 
     case COOL_ACTIVE:
-        if (temperature_c <= COOLING_OFF_TEMP) {
+        if (temperature_c <= off_temp) {
             ESP_LOGI(TAG, "T=%.1f °C ≤ %.1f — Peltier OFF, flush 60 s",
-                     (double)temperature_c, (double)COOLING_OFF_TEMP);
+                     (double)temperature_c, (double)off_temp);
             relay_off(GPIO_PELTIER);
             /* Circulation pump stays ON for 60 s to flush residual cold */
             s_cooling_state = COOL_FLUSHING;
@@ -374,10 +408,10 @@ void actuators_control_cooling(float temperature_c)
         break;
 
     case COOL_FLUSHING:
-        if (temperature_c > COOLING_ON_TEMP) {
+        if (temperature_c > on_temp) {
             /* Temperature rose again during flush — cancel flush, resume cooling */
             ESP_LOGI(TAG, "T=%.1f °C > %.1f during flush — resuming cooling",
-                     (double)temperature_c, (double)COOLING_ON_TEMP);
+                     (double)temperature_c, (double)on_temp);
             esp_timer_stop(s_flush_timer);
             relay_on(GPIO_PELTIER);
             s_cooling_state = COOL_ACTIVE;

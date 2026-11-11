@@ -55,7 +55,7 @@ static const char *TAG = "temp_sensor";
 #define OW_READ_HIGH_US         50
 
 /* DS18B20 conversion time (750 ms for 12-bit resolution, per datasheet) */
-#define DS18B20_CONV_WAIT_MS    750
+#define DS18B20_CONV_WAIT_MS    800 /* datasheet maximum 750 ms at 12-bit + margin */
 
 /* -------------------------------------------------------------------------- */
 /* 1-Wire Low-Level Bus Operations                                            */

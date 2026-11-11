@@ -1,3 +1,10 @@
 idf_component_register(SRCS "main.c"
-                       INCLUDE_DIRS "."
-                       REQUIRES temp_sensor ph_sensor tds_sensor actuators fuzzy_control firebase_client lcd_display esp_driver_gpio esp_adc espressif__cjson)
+                            "bench/bench_all_sensors.c"
+                            "bench/bench_firebase_sim.c"
+                            "bench/bench_ph_sensor.c"
+                            "bench/bench_relay.c"
+                            "bench/bench_tds_sensor.c"
+                            "bench/bench_temp_sensor.c"
+                            "bench/bench_test.c"
+                       INCLUDE_DIRS "." "bench"
+                       REQUIRES temp_sensor ph_sensor tds_sensor actuators fuzzy_control firebase_client lcd_display esp_driver_gpio esp_driver_i2c esp_adc espressif__cjson esp_wifi esp_event esp_netif esp_timer nvs_flash lwip)

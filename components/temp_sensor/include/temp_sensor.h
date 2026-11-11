@@ -39,7 +39,7 @@ bool temp_sensor_init(void);
  *
  * Uses Skip ROM (0xCC) to address a single device on the bus.
  * The caller must wait at least 750 ms before reading the result
- * for 12-bit resolution.
+ * for 12-bit resolution. The convenience sampler waits 800 ms for margin.
  *
  * @return true if the command was acknowledged, false on bus error.
  */
@@ -58,7 +58,7 @@ float temp_sensor_read_temp(void);
 /**
  * @brief Convenience: trigger conversion, wait, and read temperature.
  *
- * Blocks for 750 ms during conversion.  Equivalent to calling
+ * Blocks for 800 ms during conversion.  Equivalent to calling
  * start_conversion() followed by a delay and read_temp().
  *
  * @return Temperature in °C, or TEMP_SENSOR_NO_DEVICE (-999.0f) on error.

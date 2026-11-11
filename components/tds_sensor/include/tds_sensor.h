@@ -70,10 +70,10 @@ int tds_sensor_init(adc_oneshot_unit_handle_t existing_handle);
 float tds_sensor_read_voltage(void);
 
 /**
- * @brief Read temperature-compensated TDS value in ppm.
+ * @brief Read 30-sample median-filtered, temperature-compensated TDS in ppm.
  *
  * Flow:
- *   1. Measure raw voltage at ADC pin
+ *   1. Collect 30 ADC readings 40 ms apart and use their median voltage
  *   2. If TDS_USE_VOLTAGE_DIVIDER: V_sensor = V_adc * 1.5
  *   3. Temperature-compensate voltage (DFRobot model):
  *        V_comp = V_sensor / (1.0 + 0.02 * (T - 25.0))
@@ -86,6 +86,13 @@ float tds_sensor_read_voltage(void);
  * @return Calibrated TDS in ppm.
  */
 float tds_sensor_read_tds(float temperature_c);
+
+/** Same filtered reading, optionally returning the voltage used for its ppm.
+ * The output voltage is -1.0f on error. One call takes about 1.16 seconds. */
+float tds_sensor_read_tds_filtered(float temperature_c, float *filtered_voltage_out);
+
+/** Convert an already-filtered TDS value to EC without taking new ADC samples. */
+float tds_sensor_ec_from_tds(float tds_ppm);
 
 /**
  * @brief Read temperature-compensated EC (Electrical Conductivity).

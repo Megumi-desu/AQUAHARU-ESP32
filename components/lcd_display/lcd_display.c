@@ -22,6 +22,7 @@
 #include "driver/i2c_master.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -59,7 +60,7 @@ static const uint8_t s_row_addr[4] = { 0x00, 0x40, 0x14, 0x54 };
 
 #define PULSE_US       1
 #define CMD_DELAY_US   50
-#define CLEAR_DELAY_MS 2
+#define CLEAR_DELAY_MS 3
 #define INIT_DELAY_MS  50
 
 /* -------------------------------------------------------------------------- */
@@ -84,7 +85,9 @@ static bool                     s_bl   = true;   /* backlight on by default */
  */
 static esp_err_t pcf_write(uint8_t byte)
 {
-    return i2c_master_transmit(s_dev, &byte, 1, 10);
+    /* FreeRTOS tick is 10 ms (CONFIG_FREERTOS_HZ=100): a 10 ms timeout is only
+     * 1 tick and can expire mid-transfer, so allow several ticks. */
+    return i2c_master_transmit(s_dev, &byte, 1, 100);
 }
 
 /**
@@ -173,7 +176,7 @@ int lcd_init(void)
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address  = LCD_I2C_ADDR,
-        .scl_speed_hz    = 400000,
+        .scl_speed_hz    = 100000,   /* PCF8574 is rated 100 kHz; 400 kHz corrupted data on bench */
     };
 
     ret = i2c_master_bus_add_device(s_bus, &dev_cfg, &s_dev);
@@ -185,7 +188,7 @@ int lcd_init(void)
         return ret;
     }
 
-    ESP_LOGI(TAG, "I2C initialised — SDA=21, SCL=22, addr=0x%02X, 400 kHz",
+    ESP_LOGI(TAG, "I2C initialised — SDA=21, SCL=22, addr=0x%02X, 100 kHz",
              LCD_I2C_ADDR);
 
     /* ---- HD44780 4-bit initialisation sequence ---- */
@@ -193,9 +196,10 @@ int lcd_init(void)
     /* Data sheet: wait >40 ms after Vcc rises to 2.7 V */
     vTaskDelay(pdMS_TO_TICKS(INIT_DELAY_MS));
 
-    /* Three wake-up pulses in 8-bit mode */
+    /* Three wake-up pulses in 8-bit mode.  Sub-tick waits use busy delays:
+     * pdMS_TO_TICKS(5) is 0 ticks at 100 Hz. */
     lcd_send_nibble(0x30, false);
-    vTaskDelay(pdMS_TO_TICKS(5));
+    esp_rom_delay_us(5000);
 
     lcd_send_nibble(0x30, false);
     esp_rom_delay_us(150);
@@ -212,7 +216,7 @@ int lcd_init(void)
     lcd_command(LCD_CMD_FUNCTION);          /* 4-bit, 2-line, 5×8 */
     lcd_command(LCD_CMD_DISP_OFF);          /* display OFF */
     lcd_command(LCD_CMD_CLEAR);             /* clear */
-    vTaskDelay(pdMS_TO_TICKS(CLEAR_DELAY_MS));
+    esp_rom_delay_us(CLEAR_DELAY_MS * 1000);
 
     lcd_command(LCD_CMD_ENTRY_MODE);        /* increment, no shift */
     lcd_command(LCD_CMD_DISP_ON);           /* display ON, cursor OFF */
@@ -231,7 +235,7 @@ void lcd_clear(void)
     if (!s_init) return;
 
     lcd_command(LCD_CMD_CLEAR);
-    vTaskDelay(pdMS_TO_TICKS(CLEAR_DELAY_MS));
+    esp_rom_delay_us(CLEAR_DELAY_MS * 1000);
 }
 
 /* -------------------------------------------------------------------------- */
